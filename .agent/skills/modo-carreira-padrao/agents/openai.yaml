@@ -1,0 +1,4 @@
+﻿interface:
+  display_name: "Padrao Modo Carreira"
+  short_description: "Padroniza alteracoes do projeto Modo Carreira"
+  default_prompt: "Use $modo-carreira-padrao para implementar mudancas mantendo os padroes arquiteturais e de qualidade deste projeto."

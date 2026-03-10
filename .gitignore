@@ -1,0 +1,17 @@
+﻿# Python cache
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Ambiente virtual
+.venv/
+venv/
+
+# Artefatos temporarios locais
+Tmp/
+.tmp_aiseasons/
+.tmp_aiseasons_sync/
+
+# Logs e arquivos transitorios
+Logs/*.tmp
+Logs/*.log
