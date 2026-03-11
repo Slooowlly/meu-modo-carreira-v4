@@ -3,6 +3,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.abspath(__file__))))
 
+from PySide6.QtCore import QTimer
 from PySide6.QtWidgets import QApplication, QMainWindow, QVBoxLayout, QWidget
 
 from UI.temas import Estilos
@@ -46,7 +47,7 @@ class TesteUI(QMainWindow):
         card_input = CardTitulo("Configuracoes")
         card_input.add(CampoTexto("Nome", "Digite seu nome..."))
         card_input.add(CampoSlider("Idade", 16, 40, 18, " anos"))
-        card_input.add(CampoCombo("Dificuldade", ["Facil", "Medio", "Dificil", "Lendario"]))
+        card_input.add(CampoCombo("Dificuldade", ["Fácil", "Médio", "Difícil", "Lendário"]))
         layout.addWidget(card_input)
 
         card_btns = CardTitulo("Acoes")
@@ -56,8 +57,17 @@ class TesteUI(QMainWindow):
 
 
 if __name__ == "__main__":
+    # Modo automático para não travar execução em CI/smoke.
+    manual_mode = "--manual" in sys.argv
+    if manual_mode:
+        sys.argv = [arg for arg in sys.argv if arg != "--manual"]
+
     app = QApplication(sys.argv)
     janela = TesteUI()
     janela.show()
+
+    if not manual_mode:
+        QTimer.singleShot(2000, app.quit)
+
     sys.exit(app.exec())
 

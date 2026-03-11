@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
+
+from Dados.constantes import MAPA_PROGRESSAO
 
 
 LEGACY_CATEGORY_ALIASES: Dict[str, str] = {
@@ -142,6 +144,31 @@ REGRAS_CATEGORIAS: Dict[str, RegraCategoria] = {
 }
 
 
+def _iter_relacoes_mapa():
+    for trilha_id, trilha_cfg in MAPA_PROGRESSAO.items():
+        pares = trilha_cfg.get("promocao_rebaixamento", {})
+        for (origem, destino), regra in pares.items():
+            yield str(trilha_id), str(origem), str(destino), dict(regra or {})
+
+
+def _relacoes_origem(categoria_id: str) -> List[Tuple[str, str, str, dict]]:
+    categoria_norm = canonicalizar_categoria_id(categoria_id)
+    return [
+        rel
+        for rel in _iter_relacoes_mapa()
+        if canonicalizar_categoria_id(rel[1]) == categoria_norm
+    ]
+
+
+def _relacoes_destino(categoria_id: str) -> List[Tuple[str, str, str, dict]]:
+    categoria_norm = canonicalizar_categoria_id(categoria_id)
+    return [
+        rel
+        for rel in _iter_relacoes_mapa()
+        if canonicalizar_categoria_id(rel[2]) == categoria_norm
+    ]
+
+
 def canonicalizar_categoria_id(categoria_id: str) -> str:
     key = str(categoria_id or "").strip().lower()
     if key in REGRAS_CATEGORIAS:
@@ -154,23 +181,53 @@ def get_regra_categoria(categoria_id: str) -> Optional[RegraCategoria]:
 
 
 def get_categoria_destino_promocao(categoria_id: str) -> Optional[str]:
-    regra = get_regra_categoria(categoria_id)
-    return regra.categoria_destino_promocao if regra else None
+    destinos = []
+    for _trilha_id, _origem, destino, regra in _relacoes_origem(categoria_id):
+        sobem = int(regra.get("sobem", 0) or 0)
+        if sobem <= 0:
+            continue
+        destino_norm = canonicalizar_categoria_id(destino)
+        if destino_norm not in destinos:
+            destinos.append(destino_norm)
+
+    if len(destinos) == 1:
+        return destinos[0]
+    return None
 
 
 def get_categoria_destino_rebaixamento(categoria_id: str) -> Optional[str]:
-    regra = get_regra_categoria(categoria_id)
-    return regra.categoria_destino_rebaixamento if regra else None
+    destinos = []
+    for _trilha_id, origem, _destino, regra in _relacoes_destino(categoria_id):
+        descem = int(regra.get("descem", 0) or 0)
+        if descem <= 0:
+            continue
+        # Rebaixamentos por classe/marca devem ser decididos com regra dedicada.
+        if "marca" in regra or "classe" in regra:
+            return None
+        origem_norm = canonicalizar_categoria_id(origem)
+        if origem_norm not in destinos:
+            destinos.append(origem_norm)
+
+    if len(destinos) == 1:
+        return destinos[0]
+    return None
 
 
 def get_vagas_promocao(categoria_id: str) -> int:
-    regra = get_regra_categoria(categoria_id)
-    return regra.vagas_promocao if regra else 0
+    vagas = [
+        int(regra.get("sobem", 0) or 0)
+        for _trilha_id, _origem, _destino, regra in _relacoes_origem(categoria_id)
+    ]
+    if not vagas:
+        return 0
+    return max(vagas)
 
 
 def get_vagas_rebaixamento(categoria_id: str) -> int:
-    regra = get_regra_categoria(categoria_id)
-    return regra.vagas_rebaixamento if regra else 0
+    return sum(
+        int(regra.get("descem", 0) or 0)
+        for _trilha_id, _origem, _destino, regra in _relacoes_destino(categoria_id)
+    )
 
 
 def get_budget_minimo_promocao(categoria_id: str) -> float:
@@ -179,8 +236,7 @@ def get_budget_minimo_promocao(categoria_id: str) -> float:
 
 
 def pode_ser_promovida(categoria_id: str) -> bool:
-    regra = get_regra_categoria(categoria_id)
-    return bool(regra and regra.categoria_destino_promocao)
+    return bool(get_categoria_destino_promocao(categoria_id))
 
 
 def pode_ser_rebaixada(categoria_id: str) -> bool:
@@ -189,7 +245,7 @@ def pode_ser_rebaixada(categoria_id: str) -> bool:
         return False
     if regra.sem_rebaixamento_local:
         return False
-    return bool(regra.categoria_destino_rebaixamento)
+    return get_vagas_rebaixamento(categoria_id) > 0
 
 
 def get_todas_categorias() -> List[str]:
@@ -200,8 +256,48 @@ def get_categorias_por_tier(tier: int) -> List[str]:
     return [cat_id for cat_id, regra in REGRAS_CATEGORIAS.items() if regra.tier == int(tier)]
 
 
+def get_regras_rebaixamento_por_grupo(categoria_id: str) -> Dict[str, dict]:
+    """
+    Retorna regras de rebaixamento por marca/classe para a categoria destino.
+    Ex.: production_challenger -> {"mazda": {...}, "toyota": {...}, "bmw": {...}}
+    """
+    regras: Dict[str, dict] = {}
+    for trilha_id, origem, destino, regra in _relacoes_destino(categoria_id):
+        descem = int(regra.get("descem", 0) or 0)
+        if descem <= 0:
+            continue
+
+        chave_tipo = None
+        chave_valor = None
+        if "marca" in regra:
+            chave_tipo = "marca"
+            chave_valor = str(regra.get("marca", "")).strip().lower()
+        elif "classe" in regra:
+            chave_tipo = "classe"
+            chave_valor = str(regra.get("classe", "")).strip().lower()
+
+        if not chave_tipo or not chave_valor:
+            continue
+
+        regras[chave_valor] = {
+            "trilha": trilha_id,
+            "origem": canonicalizar_categoria_id(origem),
+            "destino": canonicalizar_categoria_id(destino),
+            "descem": descem,
+            "tipo": chave_tipo,
+        }
+
+    return regras
+
+
 def resolver_destino_rebaixamento_production(equipe: dict) -> str:
-    classe = str(equipe.get("carro_classe") or "").strip().lower()
+    classe = str(
+        equipe.get("pro_trilha_marca")
+        or equipe.get("carro_classe")
+        or ""
+    ).strip().lower()
+    if classe == "bmw":
+        return "bmw_m2"
     if classe == "mazda":
         return "mazda_amador"
     if classe == "toyota":
@@ -209,3 +305,14 @@ def resolver_destino_rebaixamento_production(equipe: dict) -> str:
     if classe == "bmw_m2":
         return "bmw_m2"
     return "mazda_amador"
+
+
+def _sincronizar_regras_com_mapa():
+    for categoria_id, regra in REGRAS_CATEGORIAS.items():
+        regra.categoria_destino_promocao = get_categoria_destino_promocao(categoria_id)
+        regra.categoria_destino_rebaixamento = get_categoria_destino_rebaixamento(categoria_id)
+        regra.vagas_promocao = get_vagas_promocao(categoria_id)
+        regra.vagas_rebaixamento = get_vagas_rebaixamento(categoria_id)
+
+
+_sincronizar_regras_com_mapa()

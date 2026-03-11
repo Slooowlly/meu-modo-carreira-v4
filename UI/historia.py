@@ -43,6 +43,7 @@ from UI.componentes import (
     Separador,
 )
 from UI.temas import Cores, Espacos, Fontes
+from UI.ux_helpers import UXMixin
 from Utils.bandeiras import (
     CODIGOS_BANDEIRAS_SUPORTADOS,
     obter_emoji_bandeira,
@@ -593,7 +594,7 @@ class BadgeResultadoDelegate(QStyledItemDelegate):
         painter.restore()
 
 
-class TelaHistoria(QWidget):
+class TelaHistoria(QWidget, UXMixin):
     def __init__(
         self,
         banco,
@@ -655,6 +656,7 @@ class TelaHistoria(QWidget):
 
         self._build_ui()
         self._aplicar_tema_controles_janela_parent()
+        self._setup_ux()
 
     def _build_ui(self):
         layout = QVBoxLayout(self)
@@ -1027,19 +1029,36 @@ class TelaHistoria(QWidget):
             self.stat_hist_rivais.set_valor(resumo["rivais"])
 
     def _atualizar_dados_historia(self):
-        if hasattr(self, "_atualizar_arquivo_temporadas"):
-            self._atualizar_arquivo_temporadas()
-        if hasattr(self, "_atualizar_tabela_temporadas"):
-            self._atualizar_tabela_temporadas()
-        if hasattr(self, "_atualizar_sala_trofeus"):
-            self._atualizar_sala_trofeus()
-        if hasattr(self, "_atualizar_rivalidades_ia"):
-            self._atualizar_rivalidades_ia()
-        self._atualizar_header_historia()
+        def _executar_atualizacao():
+            if hasattr(self, "_atualizar_arquivo_temporadas"):
+                self._atualizar_arquivo_temporadas()
+            if hasattr(self, "_atualizar_tabela_temporadas"):
+                self._atualizar_tabela_temporadas()
+            if hasattr(self, "_atualizar_sala_trofeus"):
+                self._atualizar_sala_trofeus()
+            if hasattr(self, "_atualizar_rivalidades_ia"):
+                self._atualizar_rivalidades_ia()
+            self._atualizar_header_historia()
+
+        if getattr(self, "_ux_initialized", False):
+            self.executar_com_loading(
+                operacao=_executar_atualizacao,
+                mensagem="Atualizando dados da historia...",
+                callback_sucesso=lambda: self.mostrar_toast_sucesso("Dados da historia atualizados."),
+            )
+            return
+
+        _executar_atualizacao()
 
     def _mostrar_aba_historia(self, indice: int):
         if 0 <= indice < self.tabs.count():
-            self.tabs.setCurrentIndex(indice)
+            if getattr(self, "_ux_initialized", False) and hasattr(self, "transicao_para_aba"):
+                self.transicao_para_aba(indice)
+                self._atualizar_navegacao_historia_ativa()
+            else:
+                self.tabs.setCurrentIndex(indice)
+                self._atualizar_navegacao_historia_ativa()
+            return
         self._atualizar_navegacao_historia_ativa()
 
     def _atualizar_navegacao_historia_ativa(self, *_):
@@ -2375,7 +2394,7 @@ class TelaHistoria(QWidget):
         botao.setText(f"{seta} {texto_ano}")
 
     def _abrir_detalhes_temporada(self, ano: int, categoria_id: str):
-        self.tabs.setCurrentWidget(self.tab_temporadas)
+        self._mostrar_aba_historia(0)
         self.combo_ano.setCurrentText(str(ano))
 
         categoria_nome = self._nome_categoria_por_id(categoria_id)

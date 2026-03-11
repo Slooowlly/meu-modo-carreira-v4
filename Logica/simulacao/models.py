@@ -108,6 +108,9 @@ class RaceDriverResult:
 
     grid_position: int
     finish_position: int
+    class_id: str = ""
+    class_position: int = 0
+    points_in_class: int = 0
     positions_gained: int = 0
 
     best_lap_time_ms: float = 0

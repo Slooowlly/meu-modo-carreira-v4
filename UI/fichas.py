@@ -1674,7 +1674,7 @@ class FichaPiloto(QDialog):
 
         rot_skill, cor_skill = self._rotulo_skill(skill)
         rot_agg, cor_agg = self._rotulo_agressividade(aggression)
-        rot_pot, cor_pot = self._rotulo_potencial(potencial)
+        rot_teto, cor_teto, valor_teto = self._rotulo_teto_estimado(potencial)
         rot_consist, cor_consist = self._rotulo_consistencia(taxa_dnf)
 
         painel_attr_layout.addWidget(
@@ -1684,7 +1684,13 @@ class FichaPiloto(QDialog):
             self._criar_linha_atributo_qualitativo("Agressividade", aggression, rot_agg, cor_agg, cor_agg)
         )
         painel_attr_layout.addWidget(
-            self._criar_linha_atributo_qualitativo("Potencial", potencial, rot_pot, cor_pot, cor_pot)
+            self._criar_linha_atributo_qualitativo(
+                "Teto estimado",
+                valor_teto,
+                rot_teto,
+                cor_teto,
+                cor_teto,
+            )
         )
         painel_attr_layout.addWidget(
             self._criar_linha_atributo_qualitativo(
@@ -2082,6 +2088,15 @@ class FichaPiloto(QDialog):
         if valor >= 30:
             return "Limitado", "#94a3b8"
         return "Baixo", "#64748b"
+
+    @staticmethod
+    def _rotulo_teto_estimado(valor: int) -> tuple[str, str, int]:
+        """Retorna (rotulo, cor, valor_visual) para ocultar potencial exato."""
+        if valor >= 80:
+            return "⭐⭐⭐ Alto", "#a78bfa", 95
+        if valor >= 60:
+            return "⭐⭐ Medio", "#38bdf8", 70
+        return "⭐ Baixo", "#94a3b8", 40
 
     @staticmethod
     def _rotulo_consistencia(taxa_dnf: float) -> tuple[str, str]:

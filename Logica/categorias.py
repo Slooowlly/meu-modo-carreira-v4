@@ -17,6 +17,7 @@ from Dados.constantes import (
     BONUS_POLE,
     BONUS_VOLTA_RAPIDA,
     BONUS_POSICAO_GERAL_MULTICLASSE,
+    CONFLITOS_CALENDARIO,
 )
 
 logger = logging.getLogger(__name__)
@@ -145,6 +146,84 @@ def obter_config_clima_iracing(corrida: dict) -> str:
 # ============================================================
 # CALENDÁRIO
 # ============================================================
+
+def validar_conflitos_calendario(categorias_rodada: list[str]) -> dict:
+    """
+    Valida conflitos de categorias que nao podem ocorrer na mesma rodada.
+
+    Nota:
+        A alternancia real entre categorias ainda depende de um escalonador.
+        TODO: implementar geracao de calendario alternado por rodada.
+    """
+    categorias_normalizadas = {
+        str(categoria or "").strip().lower()
+        for categoria in (categorias_rodada or [])
+        if str(categoria or "").strip()
+    }
+    conflitos = []
+    for cat_a, cat_b in CONFLITOS_CALENDARIO:
+        if cat_a in categorias_normalizadas and cat_b in categorias_normalizadas:
+            conflitos.append((cat_a, cat_b))
+    return {
+        "valido": len(conflitos) == 0,
+        "conflitos": conflitos,
+    }
+
+
+def validar_pilotos_unicos_na_rodada(banco: dict, categorias_rodada: list[str]) -> dict:
+    """Garante que um piloto ativo nao esteja em duas categorias na mesma rodada."""
+    try:
+        from Logica.pilotos import obter_pilotos_categoria
+    except Exception:
+        return {
+            "valido": True,
+            "duplicados": {},
+            "total_duplicados": 0,
+        }
+
+    categorias_normalizadas = [
+        str(categoria or "").strip().lower()
+        for categoria in (categorias_rodada or [])
+        if str(categoria or "").strip()
+    ]
+
+    aparicoes: dict[int, set[str]] = {}
+    nomes: dict[int, str] = {}
+
+    for categoria_id in categorias_normalizadas:
+        for piloto in obter_pilotos_categoria(banco, categoria_id):
+            piloto_id = piloto.get("id")
+            if not isinstance(piloto_id, int):
+                continue
+            aparicoes.setdefault(piloto_id, set()).add(categoria_id)
+            nomes[piloto_id] = str(piloto.get("nome", f"Piloto {piloto_id}") or f"Piloto {piloto_id}")
+
+    duplicados = {
+        pid: {
+            "nome": nomes.get(pid, f"Piloto {pid}"),
+            "categorias": sorted(list(categorias)),
+        }
+        for pid, categorias in aparicoes.items()
+        if len(categorias) > 1
+    }
+
+    return {
+        "valido": len(duplicados) == 0,
+        "duplicados": duplicados,
+        "total_duplicados": len(duplicados),
+    }
+
+
+def validar_integridade_rodada(banco: dict, categorias_rodada: list[str]) -> dict:
+    """Executa validacoes de integridade da rodada (conflitos + pilotos duplicados)."""
+    conflitos = validar_conflitos_calendario(categorias_rodada)
+    pilotos = validar_pilotos_unicos_na_rodada(banco, categorias_rodada)
+    return {
+        "valido": bool(conflitos.get("valido", False)) and bool(pilotos.get("valido", False)),
+        "conflitos_calendario": conflitos,
+        "pilotos_duplicados": pilotos,
+    }
+
 
 def gerar_calendario_temporada(categoria_id: str, temporada_num: int) -> list:
     """

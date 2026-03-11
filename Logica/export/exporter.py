@@ -1,57 +1,62 @@
 # Logica/export/exporter.py
 """
-Orquestrador principal do sistema de exportação.
-Calcula todos os modificadores e prepara dados para exportação.
+Main orchestrator for Module 5 export modifiers.
 
-IMPORTANTE: Este arquivo NÃO gera o JSON final.
-O JSON deve ser gerado pelo EXPORTADOR EXISTENTE no projeto.
-Este módulo apenas calcula os valores finais dos atributos.
+This module calculates final pilot attributes. It does not write the final
+roster JSON file.
 """
 
-from typing import Protocol, runtime_checkable, Optional
+from __future__ import annotations
 
-from .models import (
-    PilotExportData,
-    ModifierReport,
-    PilotContext,
-    RaceContext
-)
+from typing import Protocol, runtime_checkable
+
+from .models import PilotExportData, ModifierReport, PilotContext, RaceContext
 from .skill_modifiers import get_all_skill_modifiers
 from .aggression_modifiers import get_all_aggression_modifiers
 from .optimism_modifiers import get_all_optimism_modifiers
 from .smoothness_modifiers import get_all_smoothness_modifiers
-from .car_ids import get_car_id_for_category, get_car_name
 
 
 @runtime_checkable
 class PilotProtocol(Protocol):
-    """
-    Interface esperada do modelo Pilot do Módulo 1.
-    
-    O Pilot DEVE ter estes atributos para funcionar com o exportador.
-    """
+    """Expected pilot interface for export logic."""
+
     id: str
-    name: str
-    skill: float           # 0-100
-    agressividade: float   # 0-100
-    otimismo: float        # 0-100
-    suavidade: float       # 0-100
+    nome: str
+    skill: float
+    aggression: float
+    optimism: float
+    smoothness: float
     idade: int
-    clutch_factor: float   # 0-100
-    rain_factor: float     # 0-100
-    experience: float      # 0-100
+    fator_clutch: float
+    fator_chuva: float
+    experiencia: float
 
 
-# ==================== CAPS DE MODIFICADORES ====================
+SKILL_MODIFIER_CAP = 25.0
+AGGRESSION_MODIFIER_CAP = 25.0
+OPTIMISM_MODIFIER_CAP = 20.0
+SMOOTHNESS_MODIFIER_CAP = 20.0
 
-SKILL_MODIFIER_CAP = 25.0       # ±25% máximo
-AGGRESSION_MODIFIER_CAP = 25.0  # ±25 pontos máximo
-OPTIMISM_MODIFIER_CAP = 20.0    # ±20 pontos máximo
-SMOOTHNESS_MODIFIER_CAP = 20.0  # ±20 pontos máximo
+
+def _get(obj, key: str, default=None):
+    """Read value from dict or object using one canonical key."""
+    if isinstance(obj, dict):
+        return obj.get(key, default)
+    return getattr(obj, key, default)
+
+
+def _get_one_of(obj, keys: tuple[str, ...], default=None):
+    """Read first existing key/attribute from dict or object."""
+    for key in keys:
+        value = _get(obj, key, None)
+        if value is not None:
+            return value
+    return default
 
 
 def clamp(value: float, min_val: float, max_val: float) -> float:
-    """Limita valor entre min e max"""
+    """Clamp value between min and max."""
     return max(min_val, min(max_val, value))
 
 
@@ -59,67 +64,55 @@ def calculate_all_modifiers(
     pilot,  # PilotProtocol
     pilot_ctx: PilotContext,
     race_ctx: RaceContext,
-    races_this_season: int = 0
+    races_this_season: int = 0,
 ) -> ModifierReport:
-    """
-    Calcula todos os modificadores para um piloto.
-    """
+    """Calculate all modifiers for one pilot."""
     report = ModifierReport(
-        pilot_id=pilot.id if hasattr(pilot, 'id') else pilot.get('id', str(id(pilot))),
-        pilot_name=pilot.name if hasattr(pilot, 'name') else pilot.get('nome', 'Pilot')
+        pilot_id=str(_get(pilot, "id", str(id(pilot)))),
+        pilot_name=str(_get_one_of(pilot, ("nome", "name"), "Pilot")),
     )
 
-    # Extrair atributos dependendo se é dict ou object
-    clutch_factor = getattr(pilot, 'clutch_factor', pilot.get('clutch_factor', 50.0)) if isinstance(pilot, dict) else getattr(pilot, 'clutch_factor', 50.0)
-    rain_factor = getattr(pilot, 'rain_factor', pilot.get('fator_chuva', 50.0)) if isinstance(pilot, dict) else getattr(pilot, 'rain_factor', 50.0)
-    experience = getattr(pilot, 'experience', pilot.get('experiencia', 50.0)) if isinstance(pilot, dict) else getattr(pilot, 'experience', 50.0)
+    fator_clutch = float(_get(pilot, "fator_clutch", 50.0))
+    fator_chuva = float(_get(pilot, "fator_chuva", 50.0))
+    experiencia = float(_get(pilot, "experiencia", 50.0))
 
-    # Skill modifiers
     report.skill_modifiers = get_all_skill_modifiers(
         pilot_ctx=pilot_ctx,
         race_ctx=race_ctx,
-        clutch_factor=clutch_factor,
-        rain_factor=rain_factor
+        fator_clutch=fator_clutch,
+        fator_chuva=fator_chuva,
     )
 
-    # Aggression modifiers
     report.aggression_modifiers = get_all_aggression_modifiers(
         pilot_ctx=pilot_ctx,
-        race_ctx=race_ctx
+        race_ctx=race_ctx,
     )
 
-    # Optimism modifiers
     report.optimism_modifiers = get_all_optimism_modifiers(
         pilot_ctx=pilot_ctx,
-        race_ctx=race_ctx
+        race_ctx=race_ctx,
     )
 
-    # Smoothness modifiers
     report.smoothness_modifiers = get_all_smoothness_modifiers(
         pilot_ctx=pilot_ctx,
         race_ctx=race_ctx,
-        experience=experience,
-        rain_factor=rain_factor,
-        races_this_season=races_this_season
+        experiencia=experiencia,
+        fator_chuva=fator_chuva,
+        races_this_season=races_this_season,
     )
 
     report.calculate_totals()
-
     return report
 
 
 def apply_skill_modifier(base_skill: float, modifier_total: float) -> float:
-    """
-    Aplica modificador de skill (porcentagem).
-    """
+    """Apply percentage modifier to base skill with cap."""
     capped = clamp(modifier_total, -SKILL_MODIFIER_CAP, SKILL_MODIFIER_CAP)
     return base_skill * (1 + capped / 100)
 
 
 def apply_absolute_modifier(base_value: float, modifier_total: float, cap: float) -> float:
-    """
-    Aplica modificador absoluto (pontos).
-    """
+    """Apply absolute point modifier with cap."""
     capped = clamp(modifier_total, -cap, cap)
     return base_value + capped
 
@@ -129,62 +122,54 @@ def export_pilot_data(
     pilot_ctx: PilotContext,
     race_ctx: RaceContext,
     car_number: str = "0",
-    livery: dict = None,
-    races_this_season: int = 0
+    livery: dict | None = None,
+    races_this_season: int = 0,
 ) -> PilotExportData:
-    """
-    Calcula valores finais de um piloto para exportação.
-    """
-    import logging
-    # Calcular modificadores
+    """Calculate final export values for one pilot."""
     report = calculate_all_modifiers(
         pilot=pilot,
         pilot_ctx=pilot_ctx,
         race_ctx=race_ctx,
-        races_this_season=races_this_season
+        races_this_season=races_this_season,
     )
 
-    is_dict = isinstance(pilot, dict)
+    base_skill = float(_get(pilot, "skill", 60.0))
+    base_aggression = float(_get_one_of(pilot, ("aggression", "agressividade"), 50.0))
+    base_optimism = float(_get_one_of(pilot, ("optimism", "otimismo"), 50.0))
+    base_smoothness = float(_get_one_of(pilot, ("smoothness", "suavidade"), 50.0))
+    age = int(_get(pilot, "idade", _get(pilot, "age", 25)))
+    pilot_id = str(_get(pilot, "id", "0"))
+    display_name = str(_get_one_of(pilot, ("nome", "name"), "Pilot"))
 
-    # Extrair valores base
-    base_skill = float(pilot.get('skill', 60.0)) if is_dict else float(getattr(pilot, 'skill', 60.0))
-    base_aggression = float(pilot.get('agressividade', pilot.get('aggression', 50.0))) if is_dict else float(getattr(pilot, 'agressividade', 50.0))
-    base_optimism = float(pilot.get('otimismo', pilot.get('optimism', 50.0))) if is_dict else float(getattr(pilot, 'otimismo', 50.0))
-    base_smoothness = float(pilot.get('suavidade', pilot.get('smoothness', 50.0))) if is_dict else float(getattr(pilot, 'suavidade', 50.0))
-    age = int(pilot.get('idade', 25)) if is_dict else int(getattr(pilot, 'idade', 25))
-    pilot_id = str(pilot.get('id', '0')) if is_dict else str(getattr(pilot, 'id', '0'))
-    display_name = str(pilot.get('nome', 'Pilot')) if is_dict else str(getattr(pilot, 'name', 'Pilot'))
-
-    # Aplicar modificadores
     final_skill = apply_skill_modifier(base_skill, report.skill_total)
     final_aggression = apply_absolute_modifier(
-        base_aggression, report.aggression_total, AGGRESSION_MODIFIER_CAP
+        base_aggression,
+        report.aggression_total,
+        AGGRESSION_MODIFIER_CAP,
     )
     final_optimism = apply_absolute_modifier(
-        base_optimism, report.optimism_total, OPTIMISM_MODIFIER_CAP
+        base_optimism,
+        report.optimism_total,
+        OPTIMISM_MODIFIER_CAP,
     )
     final_smoothness = apply_absolute_modifier(
-        base_smoothness, report.smoothness_total, SMOOTHNESS_MODIFIER_CAP
+        base_smoothness,
+        report.smoothness_total,
+        SMOOTHNESS_MODIFIER_CAP,
     )
-
-    # Clampar para range do iRacing (0-100)
-    final_skill_int = int(clamp(final_skill, 0, 100))
-    final_aggression_int = int(clamp(final_aggression, 0, 100))
-    final_optimism_int = int(clamp(final_optimism, 0, 100))
-    final_smoothness_int = int(clamp(final_smoothness, 0, 100))
 
     return PilotExportData(
         pilot_id=pilot_id,
         display_name=display_name,
         car_number=car_number,
-        skill=final_skill_int,
-        aggression=final_aggression_int,
-        optimism=final_optimism_int,
-        smoothness=final_smoothness_int,
+        skill=int(clamp(final_skill, 0, 100)),
+        aggression=int(clamp(final_aggression, 0, 100)),
+        optimism=int(clamp(final_optimism, 0, 100)),
+        smoothness=int(clamp(final_smoothness, 0, 100)),
         age=age,
         livery=livery or {},
         original_skill=base_skill,
-        modifier_report=report
+        modifier_report=report,
     )
 
 
@@ -192,18 +177,16 @@ def export_all_pilots(
     pilots: list,  # list[PilotProtocol / dict]
     pilot_contexts: dict,  # dict[pilot_id, PilotContext]
     race_ctx: RaceContext,
-    car_numbers: dict = None,
-    liveries: dict = None,
-    races_this_season: int = 0
+    car_numbers: dict | None = None,
+    liveries: dict | None = None,
+    races_this_season: int = 0,
 ) -> list[PilotExportData]:
-    """
-    Exporta todos os pilotos de uma corrida.
-    """
-    exported = []
+    """Export all pilots from one race."""
+    exported: list[PilotExportData] = []
 
     for pilot in pilots:
-        pilot_id = pilot.get('id', str(id(pilot))) if isinstance(pilot, dict) else getattr(pilot, 'id', str(id(pilot)))
-        pilot_ctx = pilot_contexts.get(pilot_id, PilotContext(pilot_id=pilot_id))
+        pilot_id = _get(pilot, "id", str(id(pilot)))
+        pilot_ctx = pilot_contexts.get(pilot_id, PilotContext(pilot_id=str(pilot_id)))
         car_number = car_numbers.get(pilot_id, "0") if car_numbers else "0"
         livery = liveries.get(pilot_id, {}) if liveries else {}
 
@@ -213,7 +196,7 @@ def export_all_pilots(
             race_ctx=race_ctx,
             car_number=car_number,
             livery=livery,
-            races_this_season=races_this_season
+            races_this_season=races_this_season,
         )
         exported.append(data)
 
@@ -221,22 +204,20 @@ def export_all_pilots(
 
 
 def generate_modifier_report_text(pilots_data: list[PilotExportData]) -> str:
-    """
-    Gera relatório textual de modificadores para debug/visualização.
-    """
+    """Generate textual report with all modifiers."""
     lines = [
         "=" * 60,
-        "RELATÓRIO DE MODIFICADORES",
+        "RELATORIO DE MODIFICADORES",
         "=" * 60,
-        ""
+        "",
     ]
 
     for pilot in pilots_data:
         if pilot.modifier_report:
             lines.append(pilot.modifier_report.get_summary())
             lines.append("")
-            lines.append(f">>> VALORES FINAIS:")
-            lines.append(f"    Skill: {pilot.original_skill:.0f} → {pilot.skill}")
+            lines.append(">>> VALORES FINAIS:")
+            lines.append(f"    Skill: {pilot.original_skill:.0f} -> {pilot.skill}")
             lines.append(f"    Agressividade: {pilot.aggression}")
             lines.append(f"    Otimismo: {pilot.optimism}")
             lines.append(f"    Suavidade: {pilot.smoothness}")

@@ -140,6 +140,7 @@ class ContextoTemporada:
 
     resultados: list[int] = field(default_factory=list)
     expectativas: list[int] = field(default_factory=list)
+    motivacao_media_temporada: float = 50.0
 
     foi_promovido: bool = False
     foi_rebaixado: bool = False
@@ -175,4 +176,3 @@ class ContextoTemporada:
             if resultado > esperado + 2
         )
         return abaixo >= len(self.resultados) * 0.5
-

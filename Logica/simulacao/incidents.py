@@ -57,9 +57,10 @@ SEGMENT_INCIDENT_MULTIPLIERS = {
 }
 
 BASE_INCIDENT_CHANCES = {
-    "mechanical":   0.03,
-    "driver_error": 0.08,
-    "collision":    0.06,
+    # Alvo de calibracao: taxa total de DNF por corrida ~2% a 4%.
+    "mechanical":   0.015,
+    "driver_error": 0.017,
+    "collision":    0.006,
 }
 
 
@@ -82,7 +83,11 @@ def calculate_driver_error_chance(
     tire_wear: float = 1.0,
     physical_condition: float = 1.0,
 ) -> float:
-    consistency_mod = 1.0 - (profile.consistency / 100 * 0.60)
+    # Formula-base pedida no diagnostico:
+    # chance_erro = base * (1 - consistencia/100) * (1 + aggression/200)
+    consistency_core = max(0.05, 1.0 - (profile.consistency / 100))
+    aggression_core = 1.0 + (profile.aggression / 200)
+
     experience_mod  = 1.0 - (profile.experience  / 100 * 0.30)
 
     rain_penalty = 0.0
@@ -102,7 +107,8 @@ def calculate_driver_error_chance(
 
     final_chance = (
         base_chance
-        * consistency_mod
+        * consistency_core
+        * aggression_core
         * experience_mod
         * (1 + rain_penalty)
         * pressure_mod
@@ -188,6 +194,39 @@ def check_injury_from_incident(
     if severity != IncidentSeverity.CRITICAL:
         return False
     return incident_type == IncidentType.COLLISION and random.random() < 0.40
+
+
+def gerar_lesao(incident: Optional[IncidentResult] = None) -> dict:
+    """
+    Gera lesao para persistir no piloto apos incidente.
+
+    Formato:
+    - leve:     -5% por 2 corridas
+    - moderada: -15% por 3-5 corridas
+    - grave:    -30% por 5-8 corridas, com perda de corridas
+    """
+    _ = incident  # Mantem assinatura extensivel para regras futuras por tipo/severidade.
+    roll = random.random()
+    if roll < 0.60:
+        return {
+            "tipo": "leve",
+            "modifier": -0.05,
+            "corridas_restantes": 2,
+            "perde_corridas": False,
+        }
+    if roll < 0.90:
+        return {
+            "tipo": "moderada",
+            "modifier": -0.15,
+            "corridas_restantes": random.randint(3, 5),
+            "perde_corridas": False,
+        }
+    return {
+        "tipo": "grave",
+        "modifier": -0.30,
+        "corridas_restantes": random.randint(5, 8),
+        "perde_corridas": True,
+    }
 
 
 def roll_for_incident(

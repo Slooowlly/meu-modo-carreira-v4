@@ -6,7 +6,11 @@ from typing import Any, Dict, List, Tuple
 import random
 
 from .models import Convite, HistoricoEquipe, MotivoMovimentacao, ResultadoTemporada, StatusConvite
-from .regras import get_regra_categoria
+from .regras import (
+    get_categoria_destino_promocao,
+    get_regra_categoria,
+    get_vagas_promocao,
+)
 
 
 def _get(entidade: Any, campo: str, default=None):
@@ -102,11 +106,11 @@ def gerar_convites_categoria(
     if not regra or not regra.permite_convite:
         return convites
 
-    destino = regra.categoria_destino_promocao
+    destino = get_categoria_destino_promocao(categoria_id)
     if not destino:
         return convites
 
-    vagas_automaticas = max(0, int(regra.vagas_promocao) - int(vagas_promocao_consumidas))
+    vagas_automaticas = max(0, int(get_vagas_promocao(categoria_id)) - int(vagas_promocao_consumidas))
 
     for equipe in equipes:
         equipe_id = str(_get(equipe, "id", str(id(equipe))))

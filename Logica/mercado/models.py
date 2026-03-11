@@ -397,6 +397,10 @@ class PilotoMercado:
 
     salario_minimo: float = 10.0
     prefere_numero_1: bool = False
+    papel_atual: str = ""
+    n2_superou_n1: bool = False
+    duelos_internos_total: int = 0
+    duelos_internos_vencidos: int = 0
 
     propostas: list[Proposta] = field(default_factory=list)
 
@@ -434,6 +438,10 @@ class PilotoMercado:
             "titulos": int(self.titulos),
             "salario_minimo": float(self.salario_minimo),
             "prefere_numero_1": bool(self.prefere_numero_1),
+            "papel_atual": str(self.papel_atual),
+            "n2_superou_n1": bool(self.n2_superou_n1),
+            "duelos_internos_total": int(self.duelos_internos_total),
+            "duelos_internos_vencidos": int(self.duelos_internos_vencidos),
             "propostas": [p.to_dict() for p in self.propostas],
         }
 
@@ -468,6 +476,10 @@ class PilotoMercado:
             titulos=int(data.get("titulos", 0) or 0),
             salario_minimo=float(data.get("salario_minimo", 10.0) or 10.0),
             prefere_numero_1=bool(data.get("prefere_numero_1", False)),
+            papel_atual=str(data.get("papel_atual", "") or ""),
+            n2_superou_n1=bool(data.get("n2_superou_n1", False)),
+            duelos_internos_total=int(data.get("duelos_internos_total", 0) or 0),
+            duelos_internos_vencidos=int(data.get("duelos_internos_vencidos", 0) or 0),
             propostas=propostas,
         )
 
@@ -617,4 +629,3 @@ class EstadoMercadoPersistido:
 def estado_mercado_padrao_dict() -> dict[str, Any]:
     """Retorna estrutura padrao serializavel de mercado."""
     return EstadoMercadoPersistido().to_dict()
-

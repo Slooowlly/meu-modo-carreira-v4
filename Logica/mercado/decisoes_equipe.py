@@ -128,6 +128,20 @@ def decidir_renovacao(
             novo_salario *= 0.95
             motivo = "Desempenho mediano - salario ajustado"
 
+    # M9: N2 e o principal candidato de troca por rookie.
+    if renovar and contrato.papel == PapelEquipe.NUMERO_2:
+        if desempenho < 55:
+            renovar = False
+            motivo = "N2 abaixo da meta: equipe prioriza renovacao de cockpit"
+        elif desempenho < 65 and random.random() > 0.45:
+            renovar = False
+            motivo = "Equipe abre vaga N2 para renovacao com talento novo"
+
+    # N1 so e trocado em caso de queda severa.
+    if renovar and contrato.papel == PapelEquipe.NUMERO_1 and desempenho < 30:
+        renovar = False
+        motivo = "N1 com desempenho critico"
+
     return DecisaoRenovacao(
         piloto_id=piloto_id,
         piloto_nome=piloto_nome,
@@ -208,4 +222,3 @@ def definir_prioridades_contratacao(equipe: Any, vagas: list[VagaAberta]) -> lis
             -vaga.car_performance,
         ),
     )
-

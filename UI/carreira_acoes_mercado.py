@@ -1,8 +1,9 @@
+"""Acoes e UI da aba de mercado com feedback UX opcional."""
+
 from __future__ import annotations
 
 from typing import Any
 
-from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QAbstractItemView,
     QFrame,
@@ -20,10 +21,11 @@ from PySide6.QtWidgets import (
 from Dados.banco import salvar_banco
 from Logica.mercado import MercadoManager, Proposta
 from UI.carreira_acoes import CarreiraAcoesBaseMixin
+from Utils.helpers import obter_nome_categoria
 
 
 class MercadoMixin(CarreiraAcoesBaseMixin):
-    """Ações e UI da aba Mercado."""
+    """Acoes e UI da aba Mercado."""
 
     def _mostrar_aba_mercado(self):
         indice = int(getattr(self, "_indice_aba_mercado", -1))
@@ -78,13 +80,24 @@ class MercadoMixin(CarreiraAcoesBaseMixin):
         scroll.setWidget(body)
 
         self.tbl_mercado_propostas = self._criar_tabela(
-            ["ID", "Equipe", "Categoria", "Papel", "Salário", "Atratividade", "Status"],
-            7,
+            [
+                "ID",
+                "Equipe",
+                "Categoria",
+                "Carro",
+                "Perf Carro",
+                "Papel",
+                "Contrato",
+                "Reputacao",
+                "Aviso",
+                "Status",
+            ],
+            10,
         )
         body_layout.addWidget(self._secao("Propostas do Jogador", self.tbl_mercado_propostas))
 
         self.tbl_mercado_vagas = self._criar_tabela(
-            ["Equipe", "Categoria", "Papel", "Perf Carro", "Budget", "Reputação"],
+            ["Equipe", "Categoria", "Papel", "Perf Carro", "Budget", "Reputacao"],
             6,
         )
         body_layout.addWidget(self._secao("Vagas Abertas", self.tbl_mercado_vagas))
@@ -105,12 +118,12 @@ class MercadoMixin(CarreiraAcoesBaseMixin):
             ["Temporada", "Propostas", "Aceitas", "Recusadas", "Sem Vaga", "Rookies"],
             6,
         )
-        body_layout.addWidget(self._secao("Histórico de Janelas", self.tbl_mercado_historico))
+        body_layout.addWidget(self._secao("Historico de Janelas", self.tbl_mercado_historico))
 
         self.lbl_mercado_highlights = QLabel("Highlights")
         self.lbl_mercado_highlights.setWordWrap(True)
         self.lbl_mercado_highlights.setStyleSheet("padding: 8px; border: 1px solid #2a3547; border-radius: 8px;")
-        body_layout.addWidget(self._secao("Movimentações e Highlights", self.lbl_mercado_highlights))
+        body_layout.addWidget(self._secao("Movimentacoes e Highlights", self.lbl_mercado_highlights))
 
         return container
 
@@ -137,17 +150,94 @@ class MercadoMixin(CarreiraAcoesBaseMixin):
         lay.addWidget(widget)
         return sec
 
+    def _mercado_info(self, mensagem: str):
+        if hasattr(self, "mostrar_toast_info"):
+            self.mostrar_toast_info(mensagem)
+            return
+        QMessageBox.information(self, "Mercado", mensagem)
+
+    def _mercado_aviso(self, mensagem: str):
+        if hasattr(self, "mostrar_toast_aviso"):
+            self.mostrar_toast_aviso(mensagem)
+            return
+        QMessageBox.warning(self, "Mercado", mensagem)
+
+    def _mensagem_loading_mercado(self, acao: str) -> str:
+        mensagens = {
+            "aceitar": "Processando aceite de proposta...",
+            "recusar": "Processando recusa de proposta...",
+            "recusar_todas": "Processando recusa de todas as propostas...",
+        }
+        return mensagens.get(acao, "Processando mercado...")
+
+    @staticmethod
+    def _barra_progresso_texto(valor: float, maximo: int = 100, largura: int = 10) -> str:
+        try:
+            ratio = max(0.0, min(float(valor) / float(maximo), 1.0))
+        except (TypeError, ValueError, ZeroDivisionError):
+            ratio = 0.0
+        preenchidos = int(round(ratio * largura))
+        vazios = max(0, largura - preenchidos)
+        return ("█" * preenchidos) + ("░" * vazios)
+
+    @staticmethod
+    def _rotulo_papel_proposta(papel_raw: Any) -> str:
+        papel = str(papel_raw or "").strip().lower()
+        if papel in {"numero_1", "n1"}:
+            return "N1 (principal)"
+        if papel in {"numero_2", "n2"}:
+            return "N2"
+        if papel == "reserva":
+            return "Reserva"
+        return papel or "-"
+
+    def _obter_proposta_pendente(
+        self,
+        proposta_id: str,
+        jogador_id: Any,
+    ) -> Proposta | None:
+        manager = MercadoManager(self.banco)
+        pendencias = manager.obter_pendencias_jogador(jogador_id)
+        return next(
+            (proposta for proposta in pendencias if str(proposta.id) == str(proposta_id)),
+            None,
+        )
+
+    def _confirmar_aceite_com_aviso_conteudo(
+        self,
+        proposta: Proposta,
+    ) -> bool:
+        equipe = self._obter_equipe_por_id_hierarquia(proposta.equipe_id)
+        if not self._proposta_requer_conteudo_nao_possuido(proposta.categoria_id, equipe):
+            return True
+
+        categoria_nome = obter_nome_categoria(proposta.categoria_id)
+        carro = self._descricao_carro_proposta(proposta.categoria_id, equipe)
+        resposta = QMessageBox.question(
+            self,
+            "Aviso de Conteudo iRacing",
+            "🏎️ Proposta de equipe\n\n"
+            f"Categoria: {categoria_nome}\n"
+            f"Carro: {carro}\n\n"
+            "⚠️ Voce NAO marcou este conteudo como possuido no iRacing.\n"
+            "Voce ainda pode aceitar a proposta.\n\n"
+            "Deseja aceitar mesmo assim?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        return resposta == QMessageBox.Yes
+
     def _mercado_aceitar_proposta_selecionada(self):
         proposta_id = self._mercado_proposta_selecionada_id()
         if not proposta_id:
-            QMessageBox.information(self, "Mercado", "Selecione uma proposta para aceitar.")
+            self._mercado_info("Selecione uma proposta para aceitar.")
             return
         self._aplicar_decisao_mercado("aceitar", proposta_id)
 
     def _mercado_recusar_proposta_selecionada(self):
         proposta_id = self._mercado_proposta_selecionada_id()
         if not proposta_id:
-            QMessageBox.information(self, "Mercado", "Selecione uma proposta para recusar.")
+            self._mercado_info("Selecione uma proposta para recusar.")
             return
         self._aplicar_decisao_mercado("recusar", proposta_id)
 
@@ -166,23 +256,51 @@ class MercadoMixin(CarreiraAcoesBaseMixin):
     def _aplicar_decisao_mercado(self, acao: str, proposta_id: str | None):
         jogador = self._obter_jogador()
         if not jogador:
-            QMessageBox.warning(self, "Mercado", "Jogador não encontrado.")
+            self._mercado_aviso("Jogador nao encontrado.")
             return
 
-        manager = MercadoManager(self.banco)
-        retorno = manager.aplicar_decisao_jogador(
-            acao=acao,
-            proposta_id=proposta_id,
-            jogador_id=jogador.get("id"),
-        )
-        salvar_banco(self.banco)
-        self._atualizar_aba_mercado()
-        self._atualizar_tudo()
+        if acao == "aceitar" and proposta_id:
+            proposta = self._obter_proposta_pendente(proposta_id, jogador.get("id"))
+            if proposta is None:
+                self._mercado_aviso("Proposta selecionada nao encontrada.")
+                return
+            if not self._confirmar_aceite_com_aviso_conteudo(proposta):
+                return
 
-        if retorno.get("ok"):
-            QMessageBox.information(self, "Mercado", str(retorno.get("mensagem", "Decisão aplicada.")))
-        else:
-            QMessageBox.warning(self, "Mercado", str(retorno.get("erro", "Falha ao aplicar decisão.")))
+        def processar():
+            manager = MercadoManager(self.banco)
+            retorno_local = manager.aplicar_decisao_jogador(
+                acao=acao,
+                proposta_id=proposta_id,
+                jogador_id=jogador.get("id"),
+            )
+            salvar_banco(self.banco)
+            return retorno_local
+
+        def concluir(retorno_local=None):
+            retorno = retorno_local if isinstance(retorno_local, dict) else {}
+            self._atualizar_aba_mercado()
+            self._atualizar_tudo()
+
+            if retorno.get("ok"):
+                mensagem = str(retorno.get("mensagem", "Decisao aplicada."))
+                if hasattr(self, "mostrar_sucesso_animado"):
+                    self.mostrar_sucesso_animado()
+                if hasattr(self, "mostrar_notificacao_mercado"):
+                    tipo = "contratacao" if acao == "aceitar" else "saida"
+                    self.mostrar_notificacao_mercado(mensagem, tipo=tipo)
+                else:
+                    self._mercado_info(mensagem)
+            else:
+                self._mercado_aviso(str(retorno.get("erro", "Falha ao aplicar decisao.")))
+
+        def falhar(erro):
+            self._mercado_aviso(f"Falha ao processar acao de mercado: {erro}")
+
+        try:
+            concluir(processar())
+        except Exception as erro:  # noqa: BLE001
+            falhar(erro)
 
     def _mercado_proposta_selecionada_id(self) -> str | None:
         if not hasattr(self, "tbl_mercado_propostas"):
@@ -222,29 +340,49 @@ class MercadoMixin(CarreiraAcoesBaseMixin):
         temporada_janela = mercado.get("temporada_janela", "-")
         if tem_pendencia:
             texto = (
-                f"Temporada {temporada_janela}: você tem {len(pendencias)} proposta(s) pendente(s). "
-                "Decida para liberar o avanço da temporada."
+                f"Temporada {temporada_janela}: voce tem {len(pendencias)} proposta(s) pendente(s). "
+                "Decida para liberar o avanco da temporada."
             )
         elif janela_aberta:
             texto = (
-                f"Temporada {temporada_janela}: janela aberta sem pendência do jogador. "
-                "Você já pode finalizar a temporada."
+                f"Temporada {temporada_janela}: janela aberta sem pendencia do jogador. "
+                "Voce ja pode finalizar a temporada."
             )
         else:
-            texto = "Sem pendências do jogador no mercado."
+            texto = "Sem pendencias do jogador no mercado."
         self.lbl_mercado_status.setText(texto)
 
     def _popular_propostas(self, propostas: list[Proposta]):
         tabela: QTableWidget = self.tbl_mercado_propostas
         tabela.setRowCount(len(propostas))
         for row, proposta in enumerate(propostas):
+            equipe = self._obter_equipe_por_id_hierarquia(proposta.equipe_id)
+            categoria_nome = obter_nome_categoria(proposta.categoria_id)
+            carro = self._descricao_carro_proposta(proposta.categoria_id, equipe)
+            perf = float(proposta.car_performance or 0.0)
+            reputacao = float(proposta.reputacao_equipe or 0.0)
+            barra_perf = self._barra_progresso_texto(perf, maximo=100, largura=10)
+            aviso_conteudo = self._proposta_requer_conteudo_nao_possuido(
+                proposta.categoria_id,
+                equipe,
+            )
+            aviso_texto = "⚠ Conteudo nao possuido" if aviso_conteudo else "OK"
+
             tabela.setItem(row, 0, QTableWidgetItem(str(proposta.id)))
             tabela.setItem(row, 1, QTableWidgetItem(str(proposta.equipe_nome)))
-            tabela.setItem(row, 2, QTableWidgetItem(f"Tier {proposta.categoria_tier} ({proposta.categoria_id})"))
-            tabela.setItem(row, 3, QTableWidgetItem(str(proposta.papel.value)))
-            tabela.setItem(row, 4, QTableWidgetItem(f"{proposta.salario_anual:,.0f}".replace(",", ".")))
-            tabela.setItem(row, 5, QTableWidgetItem(f"{proposta.calcular_atratividade():.1f}"))
-            tabela.setItem(row, 6, QTableWidgetItem(str(proposta.status.value)))
+            tabela.setItem(row, 2, QTableWidgetItem(str(categoria_nome)))
+            tabela.setItem(row, 3, QTableWidgetItem(carro))
+            tabela.setItem(row, 4, QTableWidgetItem(f"{barra_perf} {int(round(perf))}/100"))
+            tabela.setItem(row, 5, QTableWidgetItem(self._rotulo_papel_proposta(proposta.papel.value)))
+            tabela.setItem(row, 6, QTableWidgetItem(f"{int(proposta.duracao_anos)} ano(s)"))
+            tabela.setItem(row, 7, QTableWidgetItem(f"{int(round(reputacao))}/100"))
+            item_aviso = QTableWidgetItem(aviso_texto)
+            if aviso_conteudo:
+                item_aviso.setToolTip(
+                    "Voce pode aceitar esta proposta mesmo sem possuir o conteudo."
+                )
+            tabela.setItem(row, 8, item_aviso)
+            tabela.setItem(row, 9, QTableWidgetItem(str(proposta.status.value)))
         if propostas:
             tabela.selectRow(0)
 
@@ -254,7 +392,8 @@ class MercadoMixin(CarreiraAcoesBaseMixin):
         tabela.setRowCount(len(vagas))
         for row, vaga in enumerate(vagas):
             tabela.setItem(row, 0, QTableWidgetItem(str(vaga.get("equipe_nome", ""))))
-            tabela.setItem(row, 1, QTableWidgetItem(f"Tier {vaga.get('categoria_tier', 1)} ({vaga.get('categoria_id', '')})"))
+            categoria = f"Tier {vaga.get('categoria_tier', 1)} ({vaga.get('categoria_id', '')})"
+            tabela.setItem(row, 1, QTableWidgetItem(categoria))
             tabela.setItem(row, 2, QTableWidgetItem(str(vaga.get("papel", ""))))
             tabela.setItem(row, 3, QTableWidgetItem(f"{float(vaga.get('car_performance', 0)):.1f}"))
             tabela.setItem(row, 4, QTableWidgetItem(f"{float(vaga.get('budget_disponivel', 0)):.1f}"))

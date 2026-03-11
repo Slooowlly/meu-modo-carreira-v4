@@ -31,9 +31,19 @@ from UI.componentes import (
 # Importa nosso backend
 from Dados.constantes import CATEGORIAS, DIFICULDADES, PISTAS_IRACING, _EQUIPES_POR_CATEGORIA
 from Dados.banco import carregar_banco, salvar_banco, banco_existe, deletar_banco
-from Logica.pilotos import popular_categoria, obter_pilotos_categoria
+from Logica.pilotos import (
+    criar_piloto,
+    obter_pilotos_categoria,
+    popular_categoria,
+    validar_schema_piloto,
+)
 from Logica.equipes import criar_todas_equipes, atribuir_pilotos_equipes
 from Logica.series_especiais import inicializar_production_car_challenge
+from Utils.iracing_conteudo import (
+    CATEGORIAS_CONTEUDO_SIMPLIFICADO,
+    PISTAS_PAGAS_OPCOES,
+    normalizar_conteudo_iracing,
+)
 
 
 class TelaInicialConfig(QMainWindow):
@@ -575,6 +585,50 @@ class TelaInicialConfig(QMainWindow):
         card_extras.add(self.check_lendas)
         
         main_layout.addWidget(card_extras)
+
+        # ── CONTEÚDO IRACING ──
+        card_conteudo = CardTitulo("🧩 Conteúdo iRacing", "Marque o conteúdo que você possui")
+        self._checks_conteudo_categoria: dict[str, CampoCheck] = {}
+        self._checks_conteudo_pistas: dict[str, CampoCheck] = {}
+
+        lbl_carros = QLabel("Quais categorias de carro você possui?")
+        lbl_carros.setFont(Fontes.label_campo())
+        lbl_carros.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        card_conteudo.add(lbl_carros)
+
+        for opcao in CATEGORIAS_CONTEUDO_SIMPLIFICADO:
+            opcao_id = str(opcao.get("id", "") or "").strip()
+            if not opcao_id:
+                continue
+            label = str(opcao.get("label", opcao_id) or opcao_id)
+            check = CampoCheck(label, checked=bool(opcao.get("free", False)))
+            self._checks_conteudo_categoria[opcao_id] = check
+            card_conteudo.add(check)
+
+        card_conteudo.add(Separador())
+
+        lbl_pistas = QLabel("Pistas pagas que você possui:")
+        lbl_pistas.setFont(Fontes.label_campo())
+        lbl_pistas.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        card_conteudo.add(lbl_pistas)
+
+        for opcao in PISTAS_PAGAS_OPCOES:
+            pista_id = str(opcao.get("id", "") or "").strip()
+            if not pista_id:
+                continue
+            label = str(opcao.get("label", pista_id) or pista_id)
+            check = CampoCheck(label, checked=False)
+            self._checks_conteudo_pistas[pista_id] = check
+            card_conteudo.add(check)
+
+        info_conteudo = QLabel(
+            "⚠️ Esse conteúdo será usado para avisar em propostas e pistas não possuídas."
+        )
+        info_conteudo.setFont(Fontes.texto_pequeno())
+        info_conteudo.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        card_conteudo.add(info_conteudo)
+        
+        main_layout.addWidget(card_conteudo)
         
         # ── BOTÕES ──
         main_layout.addWidget(Espacador(15))
@@ -840,6 +894,24 @@ class TelaInicialConfig(QMainWindow):
                 }
             )
         return calendario
+
+    def _coletar_conteudo_iracing(self) -> dict:
+        categorias = [
+            categoria_id
+            for categoria_id, check in getattr(self, "_checks_conteudo_categoria", {}).items()
+            if check.isChecked()
+        ]
+        pistas_pagas = [
+            pista_id
+            for pista_id, check in getattr(self, "_checks_conteudo_pistas", {}).items()
+            if check.isChecked()
+        ]
+        payload = {
+            "carros": list(categorias),
+            "categorias": list(categorias),
+            "pistas_pagas": list(pistas_pagas),
+        }
+        return normalizar_conteudo_iracing(payload)
     
     def _criar_carreira(self):
         """Cria a carreira com todos os dados"""
@@ -875,6 +947,7 @@ class TelaInicialConfig(QMainWindow):
             banco = criar_banco_vazio()
             
             banco["nome_jogador"] = nome
+            banco["conteudo_iracing"] = self._coletar_conteudo_iracing()
             banco["ano_atual"] = ano_inicio
             banco["ano_inicio_historico"] = ano_simulacao_inicio
             banco["idade_aposentadoria"] = idade_aposentadoria
@@ -957,41 +1030,33 @@ class TelaInicialConfig(QMainWindow):
             for piloto in banco["pilotos"]:
                 resetar_stats_temporada(piloto)
             
-            # Adiciona o jogador
-            from Dados.banco import obter_proximo_id
-            jogador = {
-                "id": obter_proximo_id(banco, "piloto"),
-                "nome": nome,
-                "idade": idade_jogador,
-                "categoria_atual": categoria_id,
-                "skill": 50,
-                "aggression": 0.5,
-                "titulos": 0,
-                "vitorias_carreira": 0,
-                "podios_carreira": 0,
-                "poles_carreira": 0,
-                "voltas_rapidas_carreira": 0,
-                "corridas_carreira": 0,
-                "pontos_carreira": 0,
-                "dnfs_carreira": 0,
-                "pontos_temporada": 0,
-                "vitorias_temporada": 0,
-                "podios_temporada": 0,
-                "poles_temporada": 0,
-                "voltas_rapidas_temporada": 0,
-                "corridas_temporada": 0,
-                "dnfs_temporada": 0,
-                "incidentes_carreira": 0,
-                "incidentes_temporada": 0,
-                "melhor_resultado_temporada": 99,
-                "temporadas_na_categoria": 0,
-                "ano_inicio_carreira": ano_inicio,
-                "resultados_temporada": [],
-                "equipe_id": None,
-                "equipe_nome": None,
-                "historico_temporadas": [],
-                "is_jogador": True
-            }
+            # Adiciona o jogador com o mesmo schema completo de qualquer NPC.
+            jogador = criar_piloto(
+                banco,
+                categoria_id=categoria_id,
+                skill_min=50,
+                skill_max=50,
+                idade_min=idade_jogador,
+                idade_max=idade_jogador,
+                ano_atual=ano_inicio,
+            )
+            jogador["nome"] = nome
+            jogador["idade"] = int(idade_jogador)
+            jogador["ano_inicio_carreira"] = int(ano_inicio)
+            jogador["is_jogador"] = True
+            jogador["status"] = "ativo"
+            jogador["contrato_anos"] = 1
+            jogador["equipe_id"] = None
+            jogador["equipe_nome"] = None
+            jogador["papel"] = None
+
+            validacao_jogador = validar_schema_piloto(jogador)
+            if not validacao_jogador["valido"]:
+                raise ValueError(
+                    "Piloto do jogador criado com schema inválido: "
+                    f"{validacao_jogador}"
+                )
+
             banco["pilotos"].append(jogador)
             
             # Garante o tamanho correto do grid e recompõe as equipes da categoria inicial.

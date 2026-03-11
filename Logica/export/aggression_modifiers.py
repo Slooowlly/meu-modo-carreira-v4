@@ -8,6 +8,8 @@ A agressividade afeta:
 - Risco assumido em freadas
 """
 
+from __future__ import annotations
+
 from .models import Modifier, ModifierSource, PilotContext, RaceContext
 
 
@@ -25,8 +27,9 @@ def calculate_frustration(pilot_ctx: PilotContext) -> Modifier:
     value = 0.0
     reasons = []
 
-    recent = pilot_ctx.last_5_results[:3]
-    expected = pilot_ctx.last_5_expected[:3] if pilot_ctx.last_5_expected else [15, 15, 15]
+    # Usa os 3 resultados mais recentes, nao os primeiros da janela.
+    recent = pilot_ctx.last_5_results[-3:]
+    expected = pilot_ctx.last_5_expected[-3:] if pilot_ctx.last_5_expected else [15, 15, 15]
 
     bad_results = sum(1 for r, e in zip(recent, expected) if r > e + 5)
 

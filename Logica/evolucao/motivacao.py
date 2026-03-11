@@ -135,7 +135,7 @@ def calcular_estagnacao(
     if temporadas_na_categoria <= 2:
         return None
 
-    penalidade = VARIACOES["estagnacao"] * (temporadas_na_categoria - 2)
+    penalidade = VARIACOES["estagnacao"]
     return AjusteMotivacao(
         penalidade,
         f"estagnacao ({temporadas_na_categoria} temporadas)",
@@ -193,4 +193,3 @@ def calcular_motivacao_media_temporada(motivacoes: list[float]) -> float:
     if not motivacoes:
         return 50.0
     return sum(motivacoes) / len(motivacoes)
-

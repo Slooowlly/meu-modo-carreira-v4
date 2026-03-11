@@ -6,6 +6,7 @@ from PySide6.QtWidgets import QMessageBox
 
 from Dados.banco import salvar_banco
 from Dados.constantes import CATEGORIAS
+from Logica.evolucao.evolucao_manager import EvolucaoManager
 from Logica.equipes import (
     calcular_pontos_equipes,
     evolucionar_equipes,
@@ -13,9 +14,7 @@ from Logica.equipes import (
 )
 from Logica.mercado import MercadoManager
 from Logica.pilotos import (
-    aposentar_piloto,
     calcular_posicao_campeonato,
-    envelhecer_pilotos,
     obter_pilotos_categoria,
 )
 from Logica.promocao import PromocaoManager, relatorio_to_dict
@@ -73,12 +72,37 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             self._simular_categorias_nao_ativas_fechamento()
             fechamento["simulacao_ai_concluida"] = True
 
-        # 2) Pre-fechamento (historico + aposentadorias), processado uma vez.
+        # 2) Pre-fechamento (historico), processado uma vez.
         ano, aposentados = self._garantir_pre_fechamento_temporada()
         if ano <= 0:
             ano = int(self.banco.get("ano_atual", 2024))
 
-        # 3) Promocao/rebaixamento de equipes (idempotente).
+        # 3) Evolucao de pilotos (M6) - idempotente por janela.
+        relatorios_evolucao: list[dict[str, Any]] = []
+        evolucao_jogador: list[dict[str, Any]] = []
+        snapshot_jogador_pre = self._snapshot_atributos_jogador()
+        if bool(fechamento.get("evolucao_processada", False)):
+            aposentados = list(fechamento.get("aposentados", []))
+            payload_relatorios = fechamento.get("relatorios_evolucao", [])
+            payload_jogador = fechamento.get("evolucao_jogador", [])
+            if isinstance(payload_relatorios, list):
+                relatorios_evolucao = [
+                    item for item in payload_relatorios if isinstance(item, dict)
+                ]
+            if isinstance(payload_jogador, list):
+                evolucao_jogador = [
+                    item for item in payload_jogador if isinstance(item, dict)
+                ]
+        else:
+            aposentados, relatorios_evolucao = self._processar_evolucao_fim_temporada(ano)
+            evolucao_jogador = self._comparar_atributos_jogador(snapshot_jogador_pre)
+            fechamento["aposentados"] = list(aposentados)
+            fechamento["total_aposentadorias"] = len(aposentados)
+            fechamento["evolucao_processada"] = True
+            fechamento["relatorios_evolucao"] = list(relatorios_evolucao)
+            fechamento["evolucao_jogador"] = list(evolucao_jogador)
+
+        # 4) Promocao/rebaixamento de equipes (M8) - idempotente.
         relatorio_promocao: dict[str, Any] = {}
         if bool(fechamento.get("promocao_processada", False)):
             payload = fechamento.get("relatorio_promocao")
@@ -90,16 +114,25 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             fechamento["promocao_processada"] = True
             fechamento["relatorio_promocao"] = relatorio_promocao
 
-        # 4/5) Mercado (com clausulas de contrato ja aplicadas no modulo de promocao).
-        resultado_mercado = self._processar_mercado_fim_temporada()
+        # 5) Limpeza de rosters antes do mercado.
+        self._sincronizar_rosters()
+
+        # 6) Mercado (M7) com clausulas de contrato ja aplicadas no modulo de promocao.
+        resultado_mercado = self._processar_mercado_fim_temporada(
+            aposentadorias_temporada=int(fechamento.get("total_aposentadorias", len(aposentados)) or len(aposentados))
+        )
         if resultado_mercado is None:
-            # Pendencia do jogador bloqueia avanco da temporada sem repetir simulacao/promocao.
+            # Pendencia do jogador bloqueia avanco da temporada sem repetir etapas anteriores.
             salvar_banco(self.banco)
             self._atualizar_tudo()
             return
 
-        # 6) Evolucao/reset existentes.
-        envelhecer_pilotos(self.banco)
+        # 7) Validacao final pos-mercado.
+        self._sincronizar_rosters()
+        validacao_ecossistema = self._validar_ecossistema_pos_mercado()
+        fechamento["validacao_pos_mercado"] = dict(validacao_ecossistema)
+
+        # Evolucao anual de equipes acontece uma unica vez apos fechar mercado.
         evolucionar_equipes(self.banco)
 
         # Exibe antes de resetar os numeros da temporada.
@@ -108,6 +141,8 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             aposentados,
             resultado_mercado=resultado_mercado,
             relatorio_promocao=relatorio_promocao,
+            evolucao_jogador=evolucao_jogador,
+            relatorios_evolucao=relatorios_evolucao,
         )
 
         self._resetar_stats_temporada()
@@ -117,6 +152,13 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         self.banco["rodada_atual"] = 1
         self.banco["temporada_concluida"] = False
         inicializar_production_car_challenge(self.banco, self.banco["ano_atual"])
+        self._sincronizar_rosters()
+        self._inicializar_hierarquias(self.banco)
+        validacao_final_ok = self._validar_ecossistema_final(self.banco)
+        fechamento["validacao_final"] = {
+            "ok": bool(validacao_final_ok),
+            "ano_validado": int(self.banco.get("ano_atual", ano + 1)),
+        }
         self._limpar_estado_fechamento_temporada()
 
         salvar_banco(self.banco)
@@ -134,9 +176,15 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             "em_andamento": False,
             "ano_base": 0,
             "aposentados": [],
+            "total_aposentadorias": 0,
             "simulacao_ai_concluida": False,
+            "evolucao_processada": False,
+            "relatorios_evolucao": [],
+            "evolucao_jogador": [],
             "promocao_processada": False,
             "relatorio_promocao": {},
+            "validacao_pos_mercado": {},
+            "validacao_final": {},
         }
         for chave, valor_padrao in defaults.items():
             if chave not in fechamento:
@@ -144,23 +192,36 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
 
         if not isinstance(fechamento.get("aposentados"), list):
             fechamento["aposentados"] = []
+        if not isinstance(fechamento.get("relatorios_evolucao"), list):
+            fechamento["relatorios_evolucao"] = []
+        if not isinstance(fechamento.get("evolucao_jogador"), list):
+            fechamento["evolucao_jogador"] = []
         if not isinstance(fechamento.get("relatorio_promocao"), dict):
             fechamento["relatorio_promocao"] = {}
+        if not isinstance(fechamento.get("validacao_pos_mercado"), dict):
+            fechamento["validacao_pos_mercado"] = {}
+        if not isinstance(fechamento.get("validacao_final"), dict):
+            fechamento["validacao_final"] = {}
 
         fechamento["em_andamento"] = bool(fechamento.get("em_andamento", False))
         fechamento["simulacao_ai_concluida"] = bool(fechamento.get("simulacao_ai_concluida", False))
+        fechamento["evolucao_processada"] = bool(fechamento.get("evolucao_processada", False))
         fechamento["promocao_processada"] = bool(fechamento.get("promocao_processada", False))
 
         try:
             fechamento["ano_base"] = int(fechamento.get("ano_base", 0) or 0)
         except (TypeError, ValueError):
             fechamento["ano_base"] = 0
+        try:
+            fechamento["total_aposentadorias"] = int(fechamento.get("total_aposentadorias", 0) or 0)
+        except (TypeError, ValueError):
+            fechamento["total_aposentadorias"] = 0
 
         return fechamento
 
     def _garantir_pre_fechamento_temporada(self) -> tuple[int, list[dict]]:
         """
-        Garante que historico e aposentadorias sejam processados uma unica vez
+        Garante que historico seja processado uma unica vez
         antes da janela de mercado.
         """
         fechamento = self._estado_fechamento_temporada()
@@ -171,7 +232,7 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
 
         ano = int(self.banco.get("ano_atual", 2024))
         self._salvar_historico_temporada(ano)
-        aposentados = self._processar_aposentadorias(ano)
+        aposentados: list[dict] = []
 
         fechamento["em_andamento"] = True
         fechamento["ano_base"] = ano
@@ -184,9 +245,270 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         fechamento["em_andamento"] = False
         fechamento["ano_base"] = 0
         fechamento["aposentados"] = []
+        fechamento["total_aposentadorias"] = 0
         fechamento["simulacao_ai_concluida"] = False
+        fechamento["evolucao_processada"] = False
+        fechamento["relatorios_evolucao"] = []
+        fechamento["evolucao_jogador"] = []
         fechamento["promocao_processada"] = False
         fechamento["relatorio_promocao"] = {}
+        fechamento["validacao_pos_mercado"] = {}
+        fechamento["validacao_final"] = {}
+
+    def _sincronizar_rosters(self) -> None:
+        """
+        Sincroniza equipes/pilotos removendo ghost IDs e alinhando papeis.
+        """
+        manager = MercadoManager(self.banco)
+        manager._sincronizar_equipes_e_papeis()
+
+    def _inicializar_hierarquias(self, banco: dict[str, Any] | None = None) -> list[dict[str, Any]]:
+        """
+        Define hierarquia N1/N2 no inicio da temporada com equipes completas.
+
+        Criterio:
+        1) Duracao de contrato
+        2) Skill
+        3) Experiencia
+        4) Idade
+        """
+        banco_ref = banco if isinstance(banco, dict) else self.banco
+        pilotos_por_id = {
+            self._normalizar_id_hierarquia(p.get("id")): p
+            for p in banco_ref.get("pilotos", [])
+            if isinstance(p, dict) and not bool(p.get("aposentado", False))
+        }
+
+        definidas: list[dict[str, Any]] = []
+        for equipe in banco_ref.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if not bool(equipe.get("ativa", True)):
+                continue
+
+            pilotos_ids = equipe.get("pilotos", [])
+            if not isinstance(pilotos_ids, list):
+                continue
+            if len(pilotos_ids) != 2:
+                continue
+
+            piloto_1 = pilotos_por_id.get(self._normalizar_id_hierarquia(pilotos_ids[0]))
+            piloto_2 = pilotos_por_id.get(self._normalizar_id_hierarquia(pilotos_ids[1]))
+            if not isinstance(piloto_1, dict) or not isinstance(piloto_2, dict):
+                continue
+
+            hierarquia = self._inicializar_hierarquia_equipe(equipe, piloto_1, piloto_2)
+            definidas.append(
+                {
+                    "equipe_id": equipe.get("id"),
+                    "equipe_nome": equipe.get("nome"),
+                    "n1_id": hierarquia.get("n1_id"),
+                    "n2_id": hierarquia.get("n2_id"),
+                    "status": hierarquia.get("status", "estavel"),
+                }
+            )
+
+        return definidas
+
+    @staticmethod
+    def _campos_evolucao_jogador() -> list[tuple[str, str]]:
+        return [
+            ("skill", "Skill"),
+            ("consistencia", "Consistencia"),
+            ("racecraft", "Racecraft"),
+            ("fitness", "Fitness"),
+            ("ritmo_classificacao", "Ritmo de classificacao"),
+            ("gestao_pneus", "Gestao de pneus"),
+            ("habilidade_largada", "Largada"),
+            ("resistencia_mental", "Resistencia mental"),
+        ]
+
+    def _snapshot_atributos_jogador(self) -> dict[str, int]:
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            return {}
+
+        snapshot: dict[str, int] = {}
+        for campo, _rotulo in self._campos_evolucao_jogador():
+            try:
+                snapshot[campo] = int(round(float(jogador.get(campo, 0) or 0)))
+            except (TypeError, ValueError):
+                snapshot[campo] = 0
+        return snapshot
+
+    def _comparar_atributos_jogador(self, snapshot_anterior: dict[str, int]) -> list[dict[str, Any]]:
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            return []
+
+        deltas: list[dict[str, Any]] = []
+        for campo, rotulo in self._campos_evolucao_jogador():
+            valor_antes = int(snapshot_anterior.get(campo, 0) or 0)
+            try:
+                valor_depois = int(round(float(jogador.get(campo, valor_antes) or valor_antes)))
+            except (TypeError, ValueError):
+                valor_depois = valor_antes
+            if valor_antes == valor_depois:
+                continue
+            deltas.append(
+                {
+                    "campo": campo,
+                    "rotulo": rotulo,
+                    "antes": valor_antes,
+                    "depois": valor_depois,
+                    "delta": valor_depois - valor_antes,
+                }
+            )
+        return deltas
+
+    def _validar_ecossistema_final(self, banco: dict[str, Any]) -> bool:
+        erros: list[str] = []
+
+        for equipe in banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if not bool(equipe.get("ativa", True)):
+                continue
+            pilotos_equipe = equipe.get("pilotos", [])
+            total_pilotos = len(pilotos_equipe) if isinstance(pilotos_equipe, list) else 0
+            if total_pilotos != 2:
+                erros.append(f"{equipe.get('nome', 'Equipe sem nome')}: {total_pilotos} pilotos")
+
+        contagens_esperadas = {
+            "mazda_rookie": 6,
+            "toyota_rookie": 6,
+            "mazda_amador": 10,
+            "toyota_amador": 10,
+            "bmw_m2": 10,
+            "production_challenger": 15,
+            "gt4": 10,
+            "gt3": 14,
+            "endurance": 21,
+        }
+        for categoria_id, esperado in contagens_esperadas.items():
+            real = len(obter_equipes_categoria(banco, categoria_id))
+            if real != esperado:
+                erros.append(f"{categoria_id}: {real} equipes (esperado {esperado})")
+
+        for equipe in banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if not bool(equipe.get("ativa", True)):
+                continue
+            pilotos_equipe = equipe.get("pilotos", [])
+            if not isinstance(pilotos_equipe, list) or len(pilotos_equipe) != 2:
+                continue
+            if not isinstance(equipe.get("hierarquia"), dict):
+                erros.append(f"{equipe.get('nome', 'Equipe sem nome')}: sem hierarquia")
+
+        for piloto in banco.get("pilotos", []):
+            if not isinstance(piloto, dict):
+                continue
+            if bool(piloto.get("aposentado", False)):
+                continue
+            status = str(piloto.get("status", "ativo") or "ativo").strip().lower()
+            if status in {"ativo", "lesionado"} and piloto.get("equipe_id") in (None, ""):
+                erros.append(
+                    f"Piloto {piloto.get('nome', 'Sem nome')} ativo sem equipe"
+                )
+
+        if erros:
+            print(f"[VALIDACAO] {len(erros)} problemas encontrados")
+            for erro in erros:
+                print(f"  - {erro}")
+            return False
+
+        print("[VALIDACAO] Ecossistema validado: sem problemas")
+        return True
+
+    def _validar_ecossistema_pos_mercado(self) -> dict[str, Any]:
+        """
+        Valida consistencia estrutural apos fechamento da janela de mercado.
+        """
+        self._sincronizar_rosters()
+        pilotos_por_id = {
+            str(p.get("id")): p
+            for p in self.banco.get("pilotos", [])
+            if isinstance(p, dict)
+        }
+
+        distribuicao_equipes: dict[int, int] = {}
+        ghost_ids = 0
+        equipes_ativas = 0
+        equipes_com_2 = 0
+        equipes_com_0_ou_1 = 0
+
+        for equipe in self.banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if not bool(equipe.get("ativa", True)):
+                continue
+
+            equipes_ativas += 1
+            pilotos_lista = equipe.get("pilotos", [])
+            if not isinstance(pilotos_lista, list):
+                pilotos_lista = []
+                equipe["pilotos"] = pilotos_lista
+
+            qtd = len(pilotos_lista)
+            distribuicao_equipes[qtd] = distribuicao_equipes.get(qtd, 0) + 1
+            if qtd == 2:
+                equipes_com_2 += 1
+            if qtd < 2:
+                equipes_com_0_ou_1 += 1
+
+            for pid in pilotos_lista:
+                piloto = pilotos_por_id.get(str(pid))
+                if not piloto:
+                    ghost_ids += 1
+                    continue
+                status = str(piloto.get("status", "ativo") or "ativo").strip().lower()
+                if (
+                    bool(piloto.get("aposentado", False))
+                    or status in {"aposentado", "reserva_global", "reserva", "livre"}
+                    or str(piloto.get("equipe_id", "")) != str(equipe.get("id", ""))
+                ):
+                    ghost_ids += 1
+
+        pilotos_ativos_sem_equipe = 0
+        for piloto in self.banco.get("pilotos", []):
+            if not isinstance(piloto, dict):
+                continue
+            if bool(piloto.get("aposentado", False)):
+                continue
+            status = str(piloto.get("status", "ativo") or "ativo").strip().lower()
+            if status not in {"ativo", "lesionado"}:
+                continue
+            if piloto.get("equipe_id") in (None, ""):
+                pilotos_ativos_sem_equipe += 1
+
+        contagem_categoria = {
+            str(categoria.get("id", "")).strip(): 0
+            for categoria in CATEGORIAS
+            if str(categoria.get("id", "")).strip()
+        }
+        for equipe in self.banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            categoria = str(equipe.get("categoria", equipe.get("categoria_id", "")) or "").strip()
+            if categoria in contagem_categoria:
+                contagem_categoria[categoria] += 1
+
+        valido = (
+            ghost_ids == 0
+            and pilotos_ativos_sem_equipe == 0
+            and equipes_com_2 == equipes_ativas
+        )
+        return {
+            "valido": valido,
+            "distribuicao_pilotos_por_equipe": dict(sorted(distribuicao_equipes.items())),
+            "equipes_ativas": equipes_ativas,
+            "equipes_com_2": equipes_com_2,
+            "equipes_com_0_ou_1": equipes_com_0_ou_1,
+            "ghost_ids": ghost_ids,
+            "pilotos_ativos_sem_equipe": pilotos_ativos_sem_equipe,
+            "contagem_equipes_por_categoria": contagem_categoria,
+        }
 
     def _aplicar_classificacao_categoria(
         self,
@@ -196,6 +518,7 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
     ) -> int:
         """Aplica classificacao simulada em uma categoria especifica."""
         aplicados = 0
+        participantes_evolucao: list[dict[str, Any]] = []
         for posicao, entrada in enumerate(classificacao, start=1):
             piloto_id = entrada.get("piloto_id", entrada.get("id"))
             piloto = self._obter_piloto_por_id(piloto_id, categoria_id)
@@ -204,13 +527,53 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
 
             volta_rapida = bool(entrada.get("volta_rapida", False))
             pole = bool(entrada.get("pole", volta_rapida))
+            try:
+                posicao_campeonato = int(
+                    entrada.get(
+                        "posicao_campeonato",
+                        entrada.get("posicao_classe", entrada.get("posicao", posicao)),
+                    )
+                )
+            except (TypeError, ValueError):
+                posicao_campeonato = posicao
+
+            pontos_override = entrada.get("pontos")
+            if isinstance(pontos_override, bool):
+                pontos_override = None
+            elif pontos_override is not None:
+                try:
+                    pontos_override = int(pontos_override)
+                except (TypeError, ValueError):
+                    pontos_override = None
 
             self._registrar_resultado_piloto(
                 piloto=piloto,
-                posicao=posicao,
+                posicao=posicao_campeonato,
                 dnf=bool(entrada.get("dnf", False)),
                 volta_rapida=volta_rapida,
                 pole=pole,
+                pontos_override=pontos_override,
+            )
+            try:
+                incidentes = int(entrada.get("incidentes", 0) or 0)
+            except (TypeError, ValueError):
+                incidentes = 0
+            participantes_evolucao.append(
+                {
+                    "piloto": piloto,
+                    "piloto_id": piloto.get("id"),
+                    "posicao": posicao_campeonato,
+                    "dnf": bool(entrada.get("dnf", False)),
+                    "pole": pole,
+                    "incidentes": incidentes,
+                    "teve_incidente": bool(incidentes > 0 or entrada.get("incidente", False)),
+                    "erro_piloto": bool(
+                        entrada.get(
+                            "erro_piloto",
+                            entrada.get("dnf_erro_proprio", False),
+                        )
+                    ),
+                }
             )
             aplicados += 1
 
@@ -219,6 +582,17 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
                 classificacao,
                 categoria_id=categoria_id,
                 rodada=rodada,
+            )
+            self._processar_pos_corrida_evolucao(
+                participantes=participantes_evolucao,
+                categoria_id=categoria_id,
+                rodada=rodada,
+            )
+            self._atualizar_hierarquia_pos_corrida(
+                resultado_corrida=classificacao,
+                categoria_id=categoria_id,
+                rodada=rodada,
+                foi_corrida_jogador=False,
             )
 
         return aplicados
@@ -229,6 +603,7 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         Retorna o total de simulacoes aplicadas.
         """
         from Logica.simulacao import simular_corrida_categoria
+        from Logica.categorias import validar_integridade_rodada
 
         categorias_alvo = [
             str(categoria.get("id", "")).strip()
@@ -244,6 +619,13 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         corridas_restantes = max(total_rodadas - corridas_disputadas, 0)
         if corridas_restantes <= 0:
             return 0
+
+        validacao_rodada = validar_integridade_rodada(self.banco, categorias_alvo)
+        if not validacao_rodada.get("valido", True):
+            raise ValueError(
+                "Conflito de calendario detectado no fechamento da temporada: "
+                f"{validacao_rodada}"
+            )
 
         simuladas = 0
         for indice_rodada in range(corridas_restantes):
@@ -347,7 +729,10 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         _ = ano
         return relatorio
 
-    def _processar_mercado_fim_temporada(self):
+    def _processar_mercado_fim_temporada(
+        self,
+        aposentadorias_temporada: int = 0,
+    ):
         """
         Executa a janela de transferencias via MercadoManager.
 
@@ -360,9 +745,11 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         temporada = int(self.banco.get("temporada_atual", 1))
 
         manager = MercadoManager(self.banco)
+        self._sincronizar_rosters()
         manager.processar_janela_transferencias(
             temporada=temporada,
             jogador_id=jogador_id,
+            aposentadorias_temporada=max(0, int(aposentadorias_temporada)),
         )
         pendencias = manager.obter_pendencias_jogador(jogador_id=jogador_id)
 
@@ -381,7 +768,9 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             )
             return None
 
-        return manager.finalizar_janela(temporada=temporada)
+        resultado = manager.finalizar_janela(temporada=temporada)
+        self._sincronizar_rosters()
+        return resultado
 
     def _salvar_historico_temporada(self, ano: int):
         """Salva o historico da temporada atual para cada piloto ativo."""
@@ -462,41 +851,77 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
                 }
             )
 
-    def _processar_aposentadorias(self, ano: int) -> list[dict]:
-        """Aposenta pilotos que atingiram o limite de idade."""
-        idade_limite = int(self.banco.get("idade_aposentadoria", 42))
-        aposentados = []
+    def _processar_evolucao_fim_temporada(self, ano: int) -> tuple[list[dict], list[dict[str, Any]]]:
+        """
+        Executa pipeline completo do M6 no fechamento da temporada.
+        """
+        manager = EvolucaoManager()
+        temporada = int(self.banco.get("temporada_atual", 1))
+        aposentados: list[dict] = []
+        relatorios: list[dict[str, Any]] = []
 
         pilotos_ativos = [
             piloto
             for piloto in self.banco.get("pilotos", [])
-            if not piloto.get("aposentado", False)
-            and not piloto.get("is_jogador", False)
+            if isinstance(piloto, dict)
+            and not bool(piloto.get("aposentado", False))
+            and str(piloto.get("status", "ativo") or "ativo").strip().lower() != "aposentado"
         ]
 
         for piloto in pilotos_ativos:
-            if piloto.get("aposentado", False):
-                continue
+            pilot_id = str(piloto.get("id", ""))
+            temporadas_na_categoria = int(piloto.get("temporadas_na_categoria", 1) or 1)
+            manager.iniciar_temporada(
+                pilot_id,
+                temporadas_na_categoria=max(1, temporadas_na_categoria),
+            )
 
-            try:
-                idade = int(piloto.get("idade", 0))
-            except (TypeError, ValueError):
-                idade = 0
+            contexto = manager.construir_contexto_temporada(
+                pilot=piloto,
+                banco=self.banco,
+                temporada=temporada,
+            )
+            relatorio = manager.processar_fim_temporada(piloto, contexto)
 
-            if idade >= idade_limite:
+            relatorios.append(
+                {
+                    "pilot_id": relatorio.pilot_id,
+                    "pilot_name": relatorio.pilot_name,
+                    "idade": relatorio.idade,
+                    "skill_anterior": relatorio.skill_anterior,
+                    "skill_novo": relatorio.skill_novo,
+                    "motivacao_media": relatorio.motivacao_media,
+                    "aposentou": relatorio.aposentou,
+                    "causa_aposentadoria": (
+                        relatorio.causa_aposentadoria.value
+                        if relatorio.causa_aposentadoria is not None
+                        else None
+                    ),
+                }
+            )
+
+            if relatorio.aposentou:
                 equipe_id = piloto.get("equipe_id")
                 categoria_id = piloto.get("categoria_atual")
-                aposentar_piloto(self.banco, piloto, ano)
+                manager.aposentar_piloto_no_banco(piloto, banco=self.banco)
+                self._sincronizar_rosters()
                 aposentados.append(
                     {
                         "nome": piloto.get("nome", "Piloto sem nome"),
-                        "idade": idade,
+                        "idade": int(piloto.get("idade", 0) or 0),
                         "equipe": equipe_id,
                         "categoria": categoria_id,
+                        "causa": (
+                            relatorio.causa_aposentadoria.value
+                            if relatorio.causa_aposentadoria is not None
+                            else "desconhecida"
+                        ),
+                        "ano": ano,
                     }
                 )
 
-        return aposentados
+        self._sincronizar_rosters()
+        return aposentados, relatorios
 
     def _resetar_stats_temporada(self):
         """Zera os numeros da temporada para pilotos e equipes."""
@@ -513,6 +938,10 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             piloto["poles_temporada"] = 0
             piloto["voltas_rapidas_temporada"] = 0
             piloto["incidentes_temporada"] = 0
+            piloto["melhor_resultado_temporada"] = 99
+            piloto["historico_motivacao_temporada"] = []
+            piloto["evolucao_resultados_temporada"] = []
+            piloto["evolucao_expectativas_temporada"] = []
 
         for equipe in self.banco.get("equipes", []):
             equipe["pontos_temporada"] = 0
@@ -528,53 +957,151 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         aposentados: list[dict],
         resultado_mercado=None,
         relatorio_promocao: dict[str, Any] | None = None,
+        evolucao_jogador: list[dict[str, Any]] | None = None,
+        relatorios_evolucao: list[dict[str, Any]] | None = None,
     ):
-        """Mostra o resumo final da temporada."""
+        """Mostra um dialogo com abas de fechamento de temporada."""
         pilotos_cat = obter_pilotos_categoria(self.banco, self.categoria_atual)
         pilotos_ord = self._ordenar_pilotos_campeonato(pilotos_cat)
         campeao = pilotos_ord[0] if pilotos_ord else None
 
-        resumo = f"Resumo da Temporada {ano}\n\n"
-
-        if campeao:
-            resumo += f"Campeao: {campeao.get('nome', 'Piloto sem nome')}\n"
-            resumo += f"   Pontos: {campeao.get('pontos_temporada', 0)}\n"
-            resumo += f"   Vitorias: {campeao.get('vitorias_temporada', 0)}\n\n"
-
         jogador = self._obter_jogador()
+        pos_jogador = None
         if jogador:
-            pos = calcular_posicao_campeonato(
+            pos_jogador = calcular_posicao_campeonato(
                 self.banco,
                 jogador,
                 jogador.get("categoria_atual", "mazda_rookie"),
             )
-            resumo += f"Sua posicao: P{pos}\n"
-            resumo += f"   Pontos: {jogador.get('pontos_temporada', 0)}\n\n"
 
+        resumo_linhas = [f"Posicao final: P{pos_jogador or '-'}"]
+        if jogador:
+            resumo_linhas.extend(
+                [
+                    f"Vitorias: {int(jogador.get('vitorias_temporada', 0) or 0)}",
+                    f"Podios: {int(jogador.get('podios_temporada', 0) or 0)}",
+                    f"Poles: {int(jogador.get('poles_temporada', 0) or 0)}",
+                    f"Pontos: {int(jogador.get('pontos_temporada', 0) or 0)}",
+                    f"Melhor resultado: P{int(jogador.get('melhor_resultado_temporada', 99) or 99)}",
+                ]
+            )
+        if campeao:
+            resumo_linhas.append("")
+            resumo_linhas.append(
+                f"Campeao da categoria: {campeao.get('nome', 'Piloto sem nome')}"
+            )
         if aposentados:
-            resumo += f"Aposentadorias: {len(aposentados)}\n"
-            for aposentado in aposentados:
-                resumo += f"   - {aposentado['nome']} ({aposentado['idade']} anos)\n"
-            resumo += "\n"
+            resumo_linhas.append("")
+            resumo_linhas.append(f"Aposentadorias: {len(aposentados)}")
+            for aposentado in aposentados[:10]:
+                nome = str(aposentado.get("nome", "Piloto sem nome"))
+                idade = int(aposentado.get("idade", 0) or 0)
+                resumo_linhas.append(f"- {nome} ({idade} anos)")
 
+        evolucao_linhas = []
+        deltas = [
+            item for item in (evolucao_jogador or []) if isinstance(item, dict)
+        ]
+        if deltas:
+            evolucao_linhas.append("Seus atributos mudaram:")
+            evolucao_linhas.append("")
+            for item in deltas:
+                rotulo = str(item.get("rotulo", item.get("campo", "Atributo")) or "Atributo")
+                antes = int(item.get("antes", 0) or 0)
+                depois = int(item.get("depois", 0) or 0)
+                delta = int(item.get("delta", 0) or 0)
+                seta = "⬆️" if delta > 0 else "⬇️"
+                evolucao_linhas.append(f"{rotulo}: {antes} -> {depois} ({delta:+d}) {seta}")
+        else:
+            evolucao_linhas.append("Sem mudancas relevantes de atributos do jogador.")
+
+        relatorios = [
+            item for item in (relatorios_evolucao or []) if isinstance(item, dict)
+        ]
+        if relatorios:
+            evolucao_linhas.append("")
+            evolucao_linhas.append(
+                f"Pilotos avaliados pelo M6: {len(relatorios)}"
+            )
+            total_aposentou = sum(1 for item in relatorios if bool(item.get("aposentou", False)))
+            evolucao_linhas.append(f"Aposentaram no M6: {total_aposentou}")
+
+        mercado_linhas = []
+        if resultado_mercado:
+            mercado_linhas.extend(
+                [
+                    f"Propostas recebidas: {int(resultado_mercado.total_propostas)}",
+                    f"Aceitas: {int(resultado_mercado.propostas_aceitas)}",
+                    f"Recusadas: {int(resultado_mercado.propostas_recusadas)}",
+                    f"Sem vaga (reserva global): {len(resultado_mercado.pilotos_sem_vaga)}",
+                    f"Rookies gerados: {len(resultado_mercado.rookies_gerados)}",
+                    "",
+                    "Destaques:",
+                ]
+            )
+            destaques = list(getattr(resultado_mercado, "movimentacoes_destaque", []) or [])
+            if destaques:
+                for destaque in destaques[:20]:
+                    mercado_linhas.append(f"- {destaque}")
+            else:
+                mercado_linhas.append("- Sem destaques.")
+        else:
+            mercado_linhas.append("Mercado sem dados para esta temporada.")
+
+        promocoes_linhas = []
         if isinstance(relatorio_promocao, dict) and relatorio_promocao:
             promocoes = relatorio_promocao.get("promocoes", [])
             rebaixamentos = relatorio_promocao.get("rebaixamentos", [])
-            liberados = int(relatorio_promocao.get("total_pilotos_liberados", 0) or 0)
-            resumo += "Promocao/Rebaixamento:\n"
-            resumo += f"   Promocoes: {len(promocoes) if isinstance(promocoes, list) else 0}\n"
-            resumo += f"   Rebaixamentos: {len(rebaixamentos) if isinstance(rebaixamentos, list) else 0}\n"
-            if liberados > 0:
-                resumo += f"   Clausulas de saida ativadas: {liberados}\n"
-            resumo += "\n"
+            promocoes_linhas.extend(
+                [
+                    f"Equipes promovidas: {len(promocoes) if isinstance(promocoes, list) else 0}",
+                    f"Equipes rebaixadas: {len(rebaixamentos) if isinstance(rebaixamentos, list) else 0}",
+                    f"Aposentadorias: {len(aposentados)}",
+                    f"Pilotos liberados por clausula: {int(relatorio_promocao.get('total_pilotos_liberados', 0) or 0)}",
+                    "",
+                    "Movimentacoes:",
+                ]
+            )
+            movs = []
+            if isinstance(promocoes, list):
+                movs.extend(promocoes[:12])
+            if isinstance(rebaixamentos, list):
+                movs.extend(rebaixamentos[:12])
+            if movs:
+                for mov in movs:
+                    if not isinstance(mov, dict):
+                        continue
+                    equipe_nome = str(mov.get("equipe_nome", "Equipe") or "Equipe")
+                    origem = str(mov.get("categoria_origem_id", "?") or "?")
+                    destino = str(mov.get("categoria_destino_id", "?") or "?")
+                    promocoes_linhas.append(f"- {equipe_nome}: {origem} -> {destino}")
+            else:
+                promocoes_linhas.append("- Sem movimentacoes detalhadas.")
+        else:
+            promocoes_linhas.append("Relatorio de promocoes indisponivel.")
 
-        if resultado_mercado:
-            resumo += "Mercado:\n"
-            resumo += f"   Propostas: {resultado_mercado.total_propostas}\n"
-            resumo += f"   Aceitas: {resultado_mercado.propostas_aceitas}\n"
-            resumo += f"   Recusadas: {resultado_mercado.propostas_recusadas}\n"
-            resumo += f"   Sem vaga (reserva global): {len(resultado_mercado.pilotos_sem_vaga)}\n"
-            resumo += f"   Rookies gerados: {len(resultado_mercado.rookies_gerados)}\n\n"
+        dados_dialogo = {
+            "resumo": "\n".join(resumo_linhas),
+            "evolucao": "\n".join(evolucao_linhas),
+            "mercado": "\n".join(mercado_linhas),
+            "promocoes": "\n".join(promocoes_linhas),
+        }
 
-        resumo += f"Avancando para {ano + 1}"
-        QMessageBox.information(self, f"Fim da Temporada {ano}", resumo)
+        try:
+            from UI.dialogs import DialogFimTemporada
+
+            dialogo = DialogFimTemporada(ano=ano, dados=dados_dialogo, parent=self)
+            dialogo.exec()
+        except Exception:
+            fallback = (
+                "\n\n".join(
+                    [
+                        "=== RESUMO ===\n" + dados_dialogo["resumo"],
+                        "=== EVOLUCAO ===\n" + dados_dialogo["evolucao"],
+                        "=== MERCADO ===\n" + dados_dialogo["mercado"],
+                        "=== PROMOCOES ===\n" + dados_dialogo["promocoes"],
+                    ]
+                )
+                + f"\n\nAvancando para {ano + 1}."
+            )
+            QMessageBox.information(self, f"Fim da Temporada {ano}", fallback)

@@ -6,7 +6,13 @@ from dataclasses import dataclass
 from typing import Any, Dict, List, Optional, Tuple
 
 from .models import HistoricoEquipe, MotivoMovimentacao, ResultadoTemporada, TipoMovimentacao
-from .regras import get_regra_categoria
+from .regras import (
+    get_categoria_destino_promocao,
+    get_categoria_destino_rebaixamento,
+    get_regra_categoria,
+    get_vagas_promocao,
+    get_vagas_rebaixamento,
+)
 
 
 @dataclass
@@ -74,10 +80,15 @@ def avaliar_elegibilidade_promocao(
     vagas_promocao_override: Optional[int] = None,
 ) -> Tuple[bool, MotivoMovimentacao, bool]:
     regra = get_regra_categoria(resultado.categoria_id)
-    if not regra or not regra.categoria_destino_promocao:
+    destino_promocao = get_categoria_destino_promocao(resultado.categoria_id)
+    if not regra or not destino_promocao:
         return False, MotivoMovimentacao.MEIO_TABELA, False
 
-    vagas = int(vagas_promocao_override if vagas_promocao_override is not None else regra.vagas_promocao)
+    vagas = int(
+        vagas_promocao_override
+        if vagas_promocao_override is not None
+        else get_vagas_promocao(resultado.categoria_id)
+    )
 
     # Evita sobreposição entre zona de promoção e zona de rebaixamento em grids pequenos.
     if int(resultado.total_equipes) > 0 and int(regra.vagas_rebaixamento) > 0:
@@ -97,6 +108,10 @@ def avaliar_elegibilidade_promocao(
     else:
         motivo = MotivoMovimentacao.TOP_3_CONSECUTIVO
 
+    categoria_norm = str(resultado.categoria_id or "").strip().lower()
+    if categoria_norm in {"gt3", "gt4"} and vagas_promocao_override is not None:
+        return True, motivo, False
+
     if float(budget_equipe) < float(regra.budget_minimo_promocao):
         return True, motivo, True
 
@@ -111,7 +126,7 @@ def avaliar_elegibilidade_rebaixamento(
     if not regra or regra.is_categoria_base or regra.sem_rebaixamento_local:
         return False, MotivoMovimentacao.MEIO_TABELA
 
-    if regra.vagas_rebaixamento <= 0:
+    if get_vagas_rebaixamento(resultado.categoria_id) <= 0:
         return False, MotivoMovimentacao.MEIO_TABELA
 
     if resultado.is_ultimo:
@@ -133,7 +148,15 @@ def avaliar_elegibilidade_convite(
     if not regra or not regra.permite_convite:
         return False, False
 
-    vagas = int(vagas_promocao_override if vagas_promocao_override is not None else regra.vagas_promocao)
+    destino_promocao = get_categoria_destino_promocao(resultado.categoria_id)
+    if not destino_promocao:
+        return False, False
+
+    vagas = int(
+        vagas_promocao_override
+        if vagas_promocao_override is not None
+        else get_vagas_promocao(resultado.categoria_id)
+    )
     if resultado.posicao_construtores <= max(0, vagas):
         return False, False
 
@@ -191,21 +214,24 @@ def avaliar_equipe(
     )
     avaliacao.elegivel_convite = elegivel_convite
 
+    destino_promocao = get_categoria_destino_promocao(resultado.categoria_id)
+    destino_rebaixamento = get_categoria_destino_rebaixamento(resultado.categoria_id)
+
     if elegivel_promo and not bloqueado:
         avaliacao.tipo_movimentacao = TipoMovimentacao.PROMOCAO
         avaliacao.motivo = motivo_promo
-        avaliacao.categoria_destino = regra.categoria_destino_promocao
+        avaliacao.categoria_destino = destino_promocao
     elif elegivel_promo and bloqueado:
         avaliacao.tipo_movimentacao = TipoMovimentacao.PERMANENCIA
         avaliacao.motivo = MotivoMovimentacao.BUDGET_INSUFICIENTE
     elif elegivel_rebaixa:
         avaliacao.tipo_movimentacao = TipoMovimentacao.REBAIXAMENTO
         avaliacao.motivo = motivo_rebaixa
-        avaliacao.categoria_destino = regra.categoria_destino_rebaixamento
+        avaliacao.categoria_destino = destino_rebaixamento
     elif elegivel_convite:
         avaliacao.tipo_movimentacao = TipoMovimentacao.CONVITE
         avaliacao.motivo = MotivoMovimentacao.TOP_3_CONSECUTIVO
-        avaliacao.categoria_destino = regra.categoria_destino_promocao
+        avaliacao.categoria_destino = destino_promocao
 
     return avaliacao
 

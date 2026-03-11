@@ -63,8 +63,10 @@ def _float(valor: Any, default: float = 0.0) -> float:
 
 def _papel_from_str(valor: Any, default: PapelEquipe = PapelEquipe.NUMERO_2) -> PapelEquipe:
     texto = str(valor or "").strip().lower()
-    if texto == PapelEquipe.NUMERO_1.value:
+    if texto in {PapelEquipe.NUMERO_1.value, "n1"}:
         return PapelEquipe.NUMERO_1
+    if texto in {PapelEquipe.NUMERO_2.value, "n2"}:
+        return PapelEquipe.NUMERO_2
     if texto == PapelEquipe.RESERVA.value:
         return PapelEquipe.RESERVA
     return default
@@ -80,8 +82,12 @@ def _status_piloto_normalizado(piloto: dict[str, Any]) -> str:
     status = str(piloto.get("status", "ativo") or "ativo").strip().lower()
     if piloto.get("aposentado", False):
         return "aposentado"
+    if status in {"reserva", "desempregado"}:
+        return "reserva_global"
     if status in {"lesionado", "aposentado", "reserva_global", "livre"}:
         return status
+    if piloto.get("equipe_id") in (None, ""):
+        return "livre"
     return "ativo"
 
 
@@ -105,9 +111,12 @@ class MercadoManager:
             "em_andamento": False,
             "ano_base": 0,
             "aposentados": [],
+            "total_aposentadorias": 0,
             "simulacao_ai_concluida": False,
+            "evolucao_processada": False,
             "promocao_processada": False,
             "relatorio_promocao": {},
+            "validacao_pos_mercado": {},
         }
         return base
 
@@ -144,9 +153,12 @@ class MercadoManager:
                 "em_andamento": False,
                 "ano_base": 0,
                 "aposentados": [],
+                "total_aposentadorias": 0,
                 "simulacao_ai_concluida": False,
+                "evolucao_processada": False,
                 "promocao_processada": False,
                 "relatorio_promocao": {},
+                "validacao_pos_mercado": {},
             }
         else:
             fechamento = atual["fechamento_temporada"]
@@ -156,12 +168,18 @@ class MercadoManager:
                 fechamento["ano_base"] = 0
             if "aposentados" not in fechamento or not isinstance(fechamento.get("aposentados"), list):
                 fechamento["aposentados"] = []
+            if "total_aposentadorias" not in fechamento:
+                fechamento["total_aposentadorias"] = 0
             if "simulacao_ai_concluida" not in fechamento:
                 fechamento["simulacao_ai_concluida"] = False
+            if "evolucao_processada" not in fechamento:
+                fechamento["evolucao_processada"] = False
             if "promocao_processada" not in fechamento:
                 fechamento["promocao_processada"] = False
             if "relatorio_promocao" not in fechamento or not isinstance(fechamento.get("relatorio_promocao"), dict):
                 fechamento["relatorio_promocao"] = {}
+            if "validacao_pos_mercado" not in fechamento or not isinstance(fechamento.get("validacao_pos_mercado"), dict):
+                fechamento["validacao_pos_mercado"] = {}
         atual["versao"] = max(_int(atual.get("versao", MERCADO_VERSAO), MERCADO_VERSAO), MERCADO_VERSAO)
         return atual
 
@@ -183,6 +201,7 @@ class MercadoManager:
         self,
         temporada: Optional[int] = None,
         jogador_id: Optional[Any] = None,
+        aposentadorias_temporada: Optional[int] = None,
     ) -> ResultadoMercado:
         temporada_ref = _int(temporada, _int(self.banco.get("temporada_atual", 1), 1))
         jogador = self._obter_jogador()
@@ -264,6 +283,7 @@ class MercadoManager:
                 self._enviar_para_reserva_global(pilotos_index.get(str(piloto.id)), reserva_global_ids)
                 resultado.pilotos_sem_vaga.append(str(piloto.id))
 
+        quantidade_rookies = self._calcular_num_rookies(aposentadorias_temporada)
         rookies_ids = self._gerar_e_inserir_rookies(
             temporada_ref,
             vagas_disponiveis,
@@ -271,6 +291,15 @@ class MercadoManager:
             pilotos_index,
             reserva_global_ids,
             resultado,
+            quantidade=quantidade_rookies,
+        )
+
+        vagas_disponiveis = self._fase_sobras_preenchimento_forcado(
+            temporada=temporada_ref,
+            equipes_index=equipes_index,
+            pilotos_index=pilotos_index,
+            reserva_global_ids=reserva_global_ids,
+            resultado=resultado,
         )
 
         self._sincronizar_equipes_e_papeis()
@@ -407,10 +436,27 @@ class MercadoManager:
         payload = mercado_raw.get("resultado_janela_atual")
         resultado = ResultadoMercado.from_dict(payload) if isinstance(payload, dict) and payload else ResultadoMercado(temporada=temporada_ref)
 
+        self._sincronizar_equipes_e_papeis()
+        equipes_index = self._index_equipes()
+        pilotos_index = self._index_pilotos()
+        vagas_restantes = self._deduplicar_vagas(
+            self._gerar_vagas_abertas(equipes_index, pilotos_index)
+        )
+        reserva_ids = set(str(pid) for pid in estado.reserva_global)
+        if vagas_restantes:
+            vagas_restantes = self._fase_sobras_preenchimento_forcado(
+                temporada=temporada_ref,
+                equipes_index=equipes_index,
+                pilotos_index=pilotos_index,
+                reserva_global_ids=reserva_ids,
+                resultado=resultado,
+            )
+        estado.reserva_global = sorted(reserva_ids)
+
         resultado.total_propostas = len(estado.propostas_atuais)
         resultado.propostas_aceitas = sum(1 for p in estado.propostas_atuais if p.status == StatusProposta.ACEITA)
         resultado.propostas_recusadas = sum(1 for p in estado.propostas_atuais if p.status == StatusProposta.RECUSADA)
-        resultado.vagas_nao_preenchidas = len(estado.vagas_abertas)
+        resultado.vagas_nao_preenchidas = len(vagas_restantes)
         resultado.vagas_preenchidas = max(0, resultado.total_propostas - resultado.vagas_nao_preenchidas)
         resultado.rookies_gerados = list(estado.rookies_gerados)
         resultado.pilotos_sem_vaga = list(estado.reserva_global)
@@ -420,7 +466,7 @@ class MercadoManager:
         estado.temporada_janela = 0
         estado.propostas_atuais = []
         estado.pendencias_jogador = []
-        estado.vagas_abertas = []
+        estado.vagas_abertas = [vaga for vaga in vagas_restantes]
         estado.rookies_gerados = []
         estado.contratos_ativos = self._reconstruir_contratos_ativos(temporada_ref)
 
@@ -549,6 +595,7 @@ class MercadoManager:
                     piloto["contrato_anos"] = duracao
                     piloto["salario"] = int(round(_float(decisao.novo_salario, _float(piloto.get("salario", 0), 0.0))))
                     piloto["papel"] = _papel_to_str(decisao.novo_papel or papel_atual)
+                    papel_novo = _papel_from_str(piloto.get("papel"), papel_atual)
                     contrato_novo = criar_contrato(
                         piloto_id=pid,
                         piloto_nome=str(piloto.get("nome", "") or ""),
@@ -557,7 +604,10 @@ class MercadoManager:
                         temporada_inicio=temporada + 1,
                         duracao_anos=duracao,
                         salario_anual=_float(piloto.get("salario", 0), 0.0),
-                        papel=_papel_from_str(piloto.get("papel"), papel_atual),
+                        papel=papel_novo,
+                        incluir_clausula_rebaixamento=True,
+                        incluir_clausula_performance=True,
+                        meta_performance=5 if papel_novo == PapelEquipe.NUMERO_1 else 10,
                     )
                     resultado.contratos_renovados.append(contrato_novo)
                 else:
@@ -617,6 +667,12 @@ class MercadoManager:
         ) + _float(piloto.get("potencial_bonus", 0), 0.0)
         experiencia = _float(piloto.get("experience", piloto.get("experiencia", 0)), 0.0)
         salario = _float(piloto.get("salario", 10000), 10000.0)
+        papel_atual = str(piloto.get("papel", "") or "").strip().lower()
+        duelos_total = _int(piloto.get("duelos_internos_total", 0), 0)
+        duelos_vencidos = _int(piloto.get("duelos_internos_vencidos", 0), 0)
+        n2_superou = bool(piloto.get("n2_superou_n1_temporada", False))
+        if not n2_superou and papel_atual in {"numero_2", "n2"}:
+            n2_superou = duelos_vencidos >= max(3, duelos_total // 2) and duelos_total > 0
 
         return PilotoMercado(
             id=str(piloto.get("id")),
@@ -637,7 +693,11 @@ class MercadoManager:
             vitorias_temporada=vitorias,
             titulos=_int(piloto.get("titulos", 0), 0),
             salario_minimo=max(10_000.0, salario * 0.9),
-            prefere_numero_1=bool(_int(piloto.get("skill", 50), 50) >= 70),
+            prefere_numero_1=bool(_int(piloto.get("skill", 50), 50) >= 70 or n2_superou),
+            papel_atual=papel_atual,
+            n2_superou_n1=n2_superou,
+            duelos_internos_total=duelos_total,
+            duelos_internos_vencidos=duelos_vencidos,
         )
 
     def _gerar_vagas_abertas(
@@ -647,6 +707,8 @@ class MercadoManager:
     ) -> list[VagaAberta]:
         vagas: list[VagaAberta] = []
         for equipe in equipes_index.values():
+            if not bool(equipe.get("ativa", True)):
+                continue
             equipe_id = str(equipe.get("id", "") or "")
             categoria_bruta = str(equipe.get("categoria", equipe.get("categoria_id", "mazda_rookie")) or "mazda_rookie")
             categoria_expandida, tier = mapear_categoria_para_expandida(categoria_bruta)
@@ -776,6 +838,9 @@ class MercadoManager:
             duracao_anos=max(1, _int(proposta.duracao_anos, 1)),
             salario_anual=float(piloto.get("salario", salario)),
             papel=proposta.papel,
+            incluir_clausula_rebaixamento=True,
+            incluir_clausula_performance=True,
+            meta_performance=5 if proposta.papel == PapelEquipe.NUMERO_1 else 10,
         )
         if resultado is not None:
             resultado.contratos_novos.append(contrato_novo)
@@ -816,6 +881,12 @@ class MercadoManager:
         equipes_index = self._index_equipes()
         pilotos = [p for p in self.banco.get("pilotos", []) if isinstance(p, dict)]
 
+        pilotos_por_id = {
+            str(p.get("id")): p
+            for p in pilotos
+            if p.get("id") not in (None, "")
+        }
+
         for equipe in equipes_index.values():
             equipe["pilotos"] = []
             equipe["piloto_numero_1"] = None
@@ -824,35 +895,84 @@ class MercadoManager:
             equipe["piloto_2"] = None
 
         for piloto in pilotos:
-            if _status_piloto_normalizado(piloto) in {"aposentado", "reserva_global"}:
+            status_norm = _status_piloto_normalizado(piloto)
+            if status_norm in {"aposentado", "reserva_global", "livre"}:
                 continue
             equipe_id = str(piloto.get("equipe_id", "") or "")
             equipe = equipes_index.get(equipe_id)
             if not equipe:
+                if status_norm not in {"lesionado"}:
+                    piloto["status"] = "livre"
+                piloto["equipe_id"] = None
+                piloto["equipe_nome"] = None
+                piloto["papel"] = None
                 continue
             equipe["pilotos"].append(piloto.get("id"))
 
         for equipe in equipes_index.values():
-            ids = list(equipe.get("pilotos", []))
-            pilotos_equipe = [p for p in pilotos if p.get("id") in ids]
+            ids = []
+            ids_vistos: set[str] = set()
+            for raw_id in list(equipe.get("pilotos", [])):
+                chave = str(raw_id)
+                if not chave or chave in ids_vistos:
+                    continue
+                ids_vistos.add(chave)
+                ids.append(raw_id)
+            equipe["pilotos"] = ids
+
+            pilotos_equipe = [
+                pilotos_por_id.get(str(pid))
+                for pid in ids
+                if pilotos_por_id.get(str(pid)) is not None
+            ]
+            pilotos_equipe = [p for p in pilotos_equipe if isinstance(p, dict)]
             pilotos_equipe.sort(key=lambda p: _float(p.get("skill", 0), 0.0), reverse=True)
-            if pilotos_equipe:
-                p1 = pilotos_equipe[0]
+
+            p1 = pilotos_equipe[0] if pilotos_equipe else None
+            p2 = pilotos_equipe[1] if len(pilotos_equipe) > 1 else None
+
+            hierarquia = equipe.get("hierarquia")
+            if isinstance(hierarquia, dict):
+                n1_id = str(hierarquia.get("n1_id", "") or "")
+                n2_id = str(hierarquia.get("n2_id", "") or "")
+                candidato_n1 = pilotos_por_id.get(n1_id)
+                candidato_n2 = pilotos_por_id.get(n2_id)
+                if candidato_n1 in pilotos_equipe and candidato_n2 in pilotos_equipe and candidato_n1 != candidato_n2:
+                    p1 = candidato_n1
+                    p2 = candidato_n2
+                elif p1 is not None and p2 is not None:
+                    hierarquia["n1_id"] = p1.get("id")
+                    hierarquia["n2_id"] = p2.get("id")
+                    hierarquia.setdefault("status", "estavel")
+                    hierarquia.setdefault("corridas_n2_a_frente", 0)
+                    hierarquia.setdefault("ultima_reavaliacao", 0)
+                    equipe["hierarquia"] = hierarquia
+
+            if p1 is not None:
                 p1["papel"] = PapelEquipe.NUMERO_1.value
                 equipe["piloto_numero_1"] = p1.get("id")
                 equipe["piloto_1"] = p1.get("nome")
-            if len(pilotos_equipe) > 1:
-                p2 = pilotos_equipe[1]
+            if p2 is not None:
                 p2["papel"] = PapelEquipe.NUMERO_2.value
                 equipe["piloto_numero_2"] = p2.get("id")
                 equipe["piloto_2"] = p2.get("nome")
             # Limita a 2 pilotos por equipe no fluxo atual.
             if len(pilotos_equipe) > 2:
-                for extra in pilotos_equipe[2:]:
+                ids_titulares = {
+                    str(p1.get("id")) if isinstance(p1, dict) else "",
+                    str(p2.get("id")) if isinstance(p2, dict) else "",
+                }
+                for extra in pilotos_equipe:
+                    if str(extra.get("id")) in ids_titulares:
+                        continue
                     extra["equipe_id"] = None
                     extra["equipe_nome"] = None
                     extra["papel"] = "reserva"
                     extra["status"] = "reserva_global"
+                    equipe["pilotos"] = [
+                        pid for pid in equipe.get("pilotos", [])
+                        if str(pid) != str(extra.get("id"))
+                    ]
 
     def _reconstruir_contratos_ativos(self, temporada: int) -> list[Contrato]:
         contratos: list[Contrato] = []
@@ -877,8 +997,8 @@ class MercadoManager:
             piloto_id = str(piloto.get("id", ""))
             chave = (piloto_id, str(equipe_id))
             contrato_prev = contratos_anteriores.get(chave)
-
-            contrato_novo = Contrato(
+            meta_performance = 5 if papel == PapelEquipe.NUMERO_1 else 10
+            contrato_novo = criar_contrato(
                 piloto_id=piloto_id,
                 piloto_nome=str(piloto.get("nome", "") or ""),
                 equipe_id=str(equipe_id),
@@ -887,13 +1007,241 @@ class MercadoManager:
                 duracao_anos=anos,
                 salario_anual=_float(piloto.get("salario", 0), 0.0),
                 papel=papel,
+                incluir_clausula_rebaixamento=True,
+                incluir_clausula_performance=True,
+                meta_performance=meta_performance,
             )
             if contrato_prev is not None and contrato_prev.esta_ativo:
-                contrato_novo.clausulas = list(contrato_prev.clausulas)
                 contrato_novo.id = contrato_prev.id
+                if contrato_prev.clausulas:
+                    contrato_novo.clausulas = list(contrato_prev.clausulas)
 
             contratos.append(contrato_novo)
         return contratos
+
+    @staticmethod
+    def _calcular_num_rookies(aposentadorias_temporada: Optional[int]) -> Optional[int]:
+        if aposentadorias_temporada is None:
+            return None
+        base = 3
+        aposentadorias = max(0, _int(aposentadorias_temporada, 0))
+        extra = max(0, aposentadorias - base)
+        return min(8, base + extra)
+
+    @staticmethod
+    def _tier_por_skill(skill: float) -> int:
+        valor = _float(skill, 50.0)
+        if valor < 40:
+            return 1
+        if valor < 50:
+            return 2
+        if valor < 60:
+            return 3
+        if valor < 70:
+            return 4
+        if valor < 80:
+            return 5
+        return 6
+
+    def _encontrar_piloto_disponivel(
+        self,
+        categoria_id: str,
+        tier: int,
+        pilotos_index: dict[str, dict[str, Any]],
+    ) -> Optional[dict[str, Any]]:
+        candidatos: list[tuple[int, int, float, float, dict[str, Any]]] = []
+        categoria_alvo = str(categoria_id or "").strip().lower()
+
+        for piloto in pilotos_index.values():
+            if not isinstance(piloto, dict):
+                continue
+            if bool(piloto.get("aposentado", False)):
+                continue
+
+            status = str(piloto.get("status", "livre") or "livre").strip().lower()
+            if piloto.get("equipe_id") not in (None, ""):
+                continue
+            if status not in {"reserva", "desempregado", "reserva_global", "livre", "ativo"}:
+                continue
+
+            categoria_piloto = str(piloto.get("categoria_atual", "") or "").strip().lower()
+            if categoria_piloto:
+                _, tier_categoria = mapear_categoria_para_expandida(categoria_piloto)
+            else:
+                tier_categoria = self._tier_por_skill(_float(piloto.get("skill", 50), 50.0))
+
+            if abs(int(tier_categoria) - int(tier)) > 1:
+                continue
+
+            prioridade_status = {
+                "reserva": 0,
+                "desempregado": 1,
+                "reserva_global": 2,
+                "livre": 3,
+                "ativo": 4,
+            }.get(status, 5)
+            skill = _float(piloto.get("skill", 0), 0.0)
+            experiencia = _float(piloto.get("experience", piloto.get("experiencia", 0)), 0.0)
+
+            # Prioriza compatibilidade direta de categoria dentro do tier.
+            bonus_categoria = 0
+            if categoria_piloto and categoria_piloto == categoria_alvo:
+                bonus_categoria = 1
+
+            candidatos.append((prioridade_status, -bonus_categoria, -skill, -experiencia, piloto))
+
+        if not candidatos:
+            return None
+
+        candidatos.sort(key=lambda item: (item[0], item[1], item[2], item[3]))
+        return candidatos[0][4]
+
+    def _assinar_contrato_forcado(
+        self,
+        piloto: dict[str, Any],
+        vaga: VagaAberta,
+        temporada: int,
+        equipes_index: dict[str, dict[str, Any]],
+        pilotos_index: dict[str, dict[str, Any]],
+        resultado: ResultadoMercado,
+    ) -> None:
+        equipe = equipes_index.get(str(vaga.equipe_id))
+        if not isinstance(equipe, dict):
+            return
+
+        self._liberar_piloto(piloto, equipes_index)
+        salario = max(10_000, int(round(_float(piloto.get("salario", 0), 0.0))))
+        if salario <= 10_000:
+            salario = max(10_000, int(round(_float(piloto.get("skill", 45), 45.0) * 1_000)))
+
+        piloto["status"] = "ativo"
+        piloto["equipe_id"] = equipe.get("id")
+        piloto["equipe_nome"] = equipe.get("nome")
+        piloto["papel"] = vaga.papel.value
+        piloto["contrato_anos"] = 1
+        piloto["salario"] = salario
+        piloto["categoria_atual"] = mapear_categoria_para_atual(vaga.categoria_id)
+
+        pilotos_ids = list(equipe.get("pilotos", [])) if isinstance(equipe.get("pilotos"), list) else []
+        if piloto.get("id") not in pilotos_ids:
+            pilotos_ids.append(piloto.get("id"))
+        equipe["pilotos"] = pilotos_ids
+
+        contrato = criar_contrato(
+            piloto_id=str(piloto.get("id", "")),
+            piloto_nome=str(piloto.get("nome", "") or ""),
+            equipe_id=str(equipe.get("id", "") or ""),
+            equipe_nome=str(equipe.get("nome", "") or ""),
+            temporada_inicio=temporada + 1,
+            duracao_anos=1,
+            salario_anual=float(salario),
+            papel=vaga.papel,
+            incluir_clausula_rebaixamento=True,
+            incluir_clausula_performance=True,
+            meta_performance=5 if vaga.papel == PapelEquipe.NUMERO_1 else 10,
+        )
+        resultado.contratos_novos.append(contrato)
+        pilotos_index[str(piloto.get("id"))] = piloto
+
+    def _gerar_piloto_emergencia(
+        self,
+        categoria_id: str,
+        tier: int,
+        temporada: int,
+        pilotos_index: dict[str, dict[str, Any]],
+    ) -> dict[str, Any]:
+        skill_ranges = {
+            1: (30, 50),
+            2: (40, 60),
+            3: (50, 70),
+            4: (55, 75),
+            5: (60, 85),
+            6: (65, 90),
+        }
+        skill_min, skill_max = skill_ranges.get(int(tier), (40, 60))
+        categoria_atual = mapear_categoria_para_atual(categoria_id)
+        ano_atual = _int(self.banco.get("ano_atual", 2024), 2024)
+
+        piloto = criar_piloto(
+            self.banco,
+            categoria_id=categoria_atual,
+            skill_min=skill_min,
+            skill_max=skill_max,
+            idade_min=20,
+            idade_max=30,
+            ano_atual=ano_atual,
+        )
+        piloto["id"] = obter_proximo_id(self.banco, "piloto")
+        piloto["status"] = "livre"
+        piloto["equipe_id"] = None
+        piloto["equipe_nome"] = None
+        piloto["papel"] = "reserva"
+        piloto["contrato_anos"] = 0
+        piloto["categoria_atual"] = categoria_atual
+        self.banco.setdefault("pilotos", []).append(piloto)
+        pilotos_index[str(piloto.get("id"))] = piloto
+        _ = temporada
+        return piloto
+
+    def _fase_sobras_preenchimento_forcado(
+        self,
+        temporada: int,
+        equipes_index: dict[str, dict[str, Any]],
+        pilotos_index: dict[str, dict[str, Any]],
+        reserva_global_ids: set[str],
+        resultado: ResultadoMercado,
+    ) -> list[VagaAberta]:
+        max_iteracoes = 50
+        for _ in range(max_iteracoes):
+            self._sincronizar_equipes_e_papeis()
+            vagas = self._deduplicar_vagas(
+                self._gerar_vagas_abertas(equipes_index, pilotos_index)
+            )
+            if not vagas:
+                return []
+
+            preencheu = False
+            for vaga in vagas:
+                equipe = equipes_index.get(str(vaga.equipe_id))
+                if not isinstance(equipe, dict):
+                    continue
+                if not bool(equipe.get("ativa", True)):
+                    continue
+
+                piloto = self._encontrar_piloto_disponivel(
+                    categoria_id=vaga.categoria_id,
+                    tier=int(vaga.categoria_tier),
+                    pilotos_index=pilotos_index,
+                )
+                if piloto is None:
+                    piloto = self._gerar_piloto_emergencia(
+                        categoria_id=vaga.categoria_id,
+                        tier=int(vaga.categoria_tier),
+                        temporada=temporada,
+                        pilotos_index=pilotos_index,
+                    )
+
+                if piloto is None:
+                    continue
+
+                self._assinar_contrato_forcado(
+                    piloto=piloto,
+                    vaga=vaga,
+                    temporada=temporada,
+                    equipes_index=equipes_index,
+                    pilotos_index=pilotos_index,
+                    resultado=resultado,
+                )
+                reserva_global_ids.discard(str(piloto.get("id")))
+                preencheu = True
+
+            if not preencheu:
+                break
+
+        self._sincronizar_equipes_e_papeis()
+        return self._deduplicar_vagas(
+            self._gerar_vagas_abertas(equipes_index, pilotos_index)
+        )
 
     def _gerar_e_inserir_rookies(
         self,
@@ -903,10 +1251,19 @@ class MercadoManager:
         pilotos_index: dict[str, dict[str, Any]],
         reserva_global_ids: set[str],
         resultado: ResultadoMercado,
+        quantidade: Optional[int] = None,
     ) -> list[str]:
         rookies_ids: list[str] = []
-        rookies = gerar_rookies_temporada()
-        vagas_ordenadas = sorted(vagas_disponiveis, key=lambda v: (v.categoria_tier, -v.car_performance))
+        rookies = gerar_rookies_temporada(quantidade=quantidade)
+        categorias_rookie = {"mazda_rookie", "toyota_rookie"}
+        vagas_ordenadas = sorted(
+            [
+                vaga
+                for vaga in vagas_disponiveis
+                if str(vaga.categoria_id or "").strip().lower() in categorias_rookie
+            ],
+            key=lambda v: (-v.car_performance, v.equipe_nome.casefold()),
+        )
 
         for rookie in rookies:
             piloto = self._criar_piloto_rookie(rookie, temporada)
@@ -933,8 +1290,10 @@ class MercadoManager:
                 self._aplicar_proposta_aceita(proposta_virtual, temporada, equipes_index, pilotos_index, resultado)
                 vagas_disponiveis[:] = self._consumir_vaga(vagas_disponiveis, proposta_virtual)
             else:
-                self._enviar_para_reserva_global(piloto, reserva_global_ids)
+                piloto["status"] = "reserva_global"
+                piloto["papel"] = "reserva"
                 resultado.pilotos_sem_vaga.append(str(piloto.get("id")))
+                reserva_global_ids.add(str(piloto.get("id")))
 
         return rookies_ids
 

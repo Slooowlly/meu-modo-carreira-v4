@@ -7,8 +7,17 @@ import json
 import logging
 import os
 
-from Dados.constantes import ARQUIVO_BANCO, PISTAS_IRACING
+from Dados.constantes import (
+    ARQUIVO_BANCO,
+    DIFICULDADES,
+    PISTAS_IRACING,
+    _EQUIPES_POR_CATEGORIA,
+)
 from Utils.helpers import normalizar_int_positivo as _normalizar_int_positivo
+from Utils.iracing_conteudo import (
+    conteudo_iracing_padrao as _conteudo_iracing_padrao,
+    normalizar_conteudo_iracing as _normalizar_conteudo_iracing,
+)
 
 
 def _recordes_padrao():
@@ -173,6 +182,487 @@ def _normalizar_ids_categoria_banco(banco):
     return alterado
 
 
+def _migrar_schema_pilotos(banco):
+    """
+    Aplica migração defensiva do schema de pilotos para bancos legados.
+    """
+    pilotos_raw = banco.get("pilotos")
+    if not isinstance(pilotos_raw, list):
+        return False
+
+    alterado = False
+    pilotos = []
+    for entrada in pilotos_raw:
+        if isinstance(entrada, dict):
+            pilotos.append(entrada)
+            continue
+        alterado = True
+
+    if len(pilotos) != len(pilotos_raw):
+        banco["pilotos"] = pilotos
+
+    try:
+        from Logica.pilotos import (
+            migrar_piloto_schema_antigo,
+            preencher_campos_obrigatorios_piloto,
+            validar_schema_piloto,
+        )
+    except Exception as erro:
+        logger.error("Falha ao importar migração de pilotos: %s", erro)
+        return alterado
+
+    ids_em_uso = set()
+    proximo_id = 1
+
+    for piloto in banco.get("pilotos", []):
+        snapshot = copy.deepcopy(piloto)
+
+        piloto_id = _normalizar_int_positivo(piloto.get("id"))
+        if piloto_id is None or piloto_id in ids_em_uso:
+            while proximo_id in ids_em_uso:
+                proximo_id += 1
+            piloto["id"] = proximo_id
+            piloto_id = proximo_id
+            proximo_id += 1
+
+        ids_em_uso.add(piloto_id)
+
+        try:
+            migrar_piloto_schema_antigo(piloto)
+        except Exception as erro:
+            logger.warning(
+                "Erro na migração automática do piloto id=%s: %s",
+                piloto_id,
+                erro,
+            )
+            preencher_campos_obrigatorios_piloto(piloto)
+
+        validacao = validar_schema_piloto(piloto)
+        if not validacao["valido"]:
+            logger.warning(
+                "Piloto id=%s ainda com schema inválido após migração. faltantes=%s nulos=%s",
+                piloto_id,
+                validacao.get("campos_faltantes", []),
+                validacao.get("campos_nulos", []),
+            )
+
+        if piloto != snapshot:
+            alterado = True
+
+    return alterado
+
+
+def _migrar_potencial_por_atributos(banco, margem=5.0):
+    """
+    Ajusta potencial de pilotos ativos para evitar clamp artificial de atributos.
+
+    Regra: quando algum atributo de performance excede potencial, eleva potencial
+    para max_atributo + margem (cap em 100), preservando o estado atual do piloto.
+    """
+    pilotos = banco.get("pilotos")
+    if not isinstance(pilotos, list):
+        return False
+
+    atributos_skill = (
+        "skill",
+        "consistencia",
+        "racecraft",
+        "ritmo_classificacao",
+        "gestao_pneus",
+        "habilidade_largada",
+        "resistencia_mental",
+        "fitness",
+        "fator_chuva",
+        "fator_clutch",
+    )
+
+    alterado = False
+    ajustados = 0
+
+    def _to_float(valor, padrao=0.0):
+        try:
+            return float(valor)
+        except (TypeError, ValueError):
+            return float(padrao)
+
+    margem_real = max(0.0, float(margem))
+    for piloto in pilotos:
+        if not isinstance(piloto, dict):
+            continue
+        if bool(piloto.get("aposentado", False)):
+            continue
+        status = str(piloto.get("status", "ativo") or "ativo").strip().lower()
+        if status == "aposentado":
+            continue
+
+        potencial_atual = _to_float(
+            piloto.get("potencial", piloto.get("potencial_base", 50.0)),
+            50.0,
+        )
+        max_attr = max(_to_float(piloto.get(atributo, 0.0), 0.0) for atributo in atributos_skill)
+
+        if max_attr <= potencial_atual:
+            continue
+
+        novo_potencial = min(100.0, max_attr + margem_real)
+        novo_potencial_int = int(round(novo_potencial))
+        if int(round(potencial_atual)) != novo_potencial_int:
+            piloto["potencial"] = novo_potencial_int
+            alterado = True
+
+        bonus = max(0.0, _to_float(piloto.get("potencial_bonus", 0.0), 0.0))
+        base_atual = _to_float(
+            piloto.get("potencial_base", piloto.get("potencial", novo_potencial_int)),
+            novo_potencial_int,
+        )
+        base_minima = max_attr + margem_real - bonus
+        nova_base = min(100.0, max(base_atual, base_minima))
+        nova_base_int = int(round(nova_base))
+        if int(round(base_atual)) != nova_base_int:
+            piloto["potencial_base"] = nova_base_int
+            alterado = True
+
+        potencial_efetivo = int(round(min(100.0, nova_base + bonus)))
+        if int(round(_to_float(piloto.get("potencial", 0.0), 0.0))) != potencial_efetivo:
+            piloto["potencial"] = potencial_efetivo
+            alterado = True
+
+        ajustados += 1
+
+    if ajustados > 0:
+        logger.info("Migracao de potencial aplicada em %d pilotos.", ajustados)
+
+    return alterado
+
+
+def _normalizar_marca_trilha_pro(valor):
+    """Normaliza identificador de marca da trilha PRO."""
+    marca = str(valor or "").strip().lower()
+    if marca == "bmw_m2":
+        return "bmw"
+    if marca in {"mazda", "toyota", "bmw"}:
+        return marca
+    return ""
+
+
+def _piloto_ativo_para_grid(piloto):
+    """Retorna True quando o piloto conta para grid ativo da categoria."""
+    if not isinstance(piloto, dict):
+        return False
+    if bool(piloto.get("aposentado", False)):
+        return False
+    status = str(piloto.get("status", "ativo") or "ativo").strip().lower()
+    return status not in {"aposentado", "reserva_global", "livre", "reserva"}
+
+
+def _ordenar_equipes_para_inativacao(equipes_categoria, nomes_canonicos):
+    """Ordena equipes priorizando inativar vagas vazias e nomes nao canonicos."""
+    nomes = set(nomes_canonicos or set())
+
+    def _chave(equipe):
+        pilotos_ids = equipe.get("pilotos", [])
+        if not isinstance(pilotos_ids, list):
+            pilotos_ids = []
+        tem_pilotos = 1 if len(pilotos_ids) > 0 else 0
+        nome = str(equipe.get("nome", "") or "")
+        eh_canonica = 1 if nome in nomes else 0
+        equipe_id = _normalizar_int_positivo(equipe.get("id")) or 0
+        # 1) sem pilotos primeiro, 2) nao canonica primeiro, 3) IDs maiores primeiro.
+        return (tem_pilotos, eh_canonica, -equipe_id)
+
+    return sorted(equipes_categoria, key=_chave)
+
+
+def _migrar_pool_equipes_canonico(banco):
+    """
+    Migra pool de equipes para o desenho canonico (102 equipes ativas).
+
+    Regras:
+    - adiciona equipes faltantes por categoria;
+    - marca excedentes como inativas (sem apagar historico);
+    - recompõe alocacao de pilotos ativos para manter 2 pilotos por equipe ativa.
+    """
+    if not isinstance(banco.get("equipes"), list):
+        return False
+    if not isinstance(banco.get("pilotos"), list):
+        return False
+    if not banco.get("equipes") and not banco.get("pilotos"):
+        return False
+
+    alterado = False
+
+    try:
+        from Logica.equipes import criar_equipe_inicial, migrar_equipe_schema_antigo
+        from Logica.pilotos import criar_piloto, preencher_campos_obrigatorios_piloto
+    except Exception as erro:
+        logger.error("Falha ao importar migradores de equipes/pilotos: %s", erro)
+        return False
+
+    equipes_somente_dict = []
+    for equipe in banco.get("equipes", []):
+        if isinstance(equipe, dict):
+            equipes_somente_dict.append(equipe)
+        else:
+            alterado = True
+    if len(equipes_somente_dict) != len(banco.get("equipes", [])):
+        banco["equipes"] = equipes_somente_dict
+
+    for equipe in banco.get("equipes", []):
+        snapshot = copy.deepcopy(equipe)
+        migrar_equipe_schema_antigo(equipe)
+        equipe["ativa"] = bool(equipe.get("ativa", True))
+        categoria = str(equipe.get("categoria", "") or "").strip().lower()
+
+        marca_pro = _normalizar_marca_trilha_pro(
+            equipe.get("pro_trilha_marca")
+            or equipe.get("carro_classe")
+        )
+        if categoria == "production_challenger":
+            if marca_pro:
+                equipe["pro_trilha_marca"] = marca_pro
+                equipe["carro_classe"] = "bmw_m2" if marca_pro == "bmw" else marca_pro
+            else:
+                equipe["pro_trilha_marca"] = None
+        else:
+            equipe.setdefault("pro_trilha_marca", None)
+
+        if categoria != "endurance":
+            equipe.setdefault("classe_endurance", None)
+
+        if equipe != snapshot:
+            alterado = True
+
+    categorias_alvo = list(_EQUIPES_POR_CATEGORIA.keys())
+    infos_por_categoria = {
+        categoria: list(_EQUIPES_POR_CATEGORIA.get(categoria, []))
+        for categoria in categorias_alvo
+    }
+    nomes_canonicos_por_categoria = {
+        categoria: {str(info.get("nome", "") or "") for info in infos}
+        for categoria, infos in infos_por_categoria.items()
+    }
+
+    # Equipes em categorias fora do design atual ficam inativas para preservar save.
+    for equipe in banco.get("equipes", []):
+        categoria = str(equipe.get("categoria", "") or "").strip().lower()
+        if categoria and categoria not in categorias_alvo and equipe.get("ativa", True):
+            equipe["ativa"] = False
+            alterado = True
+
+    ano_atual = _normalizar_int_positivo(banco.get("ano_atual")) or 2024
+
+    # Ajuste de contagem por categoria (adicionar faltantes / inativar excedentes).
+    for categoria_id in categorias_alvo:
+        alvo = len(infos_por_categoria.get(categoria_id, []))
+        equipes_categoria = [
+            equipe
+            for equipe in banco.get("equipes", [])
+            if str(equipe.get("categoria", "")).strip().lower() == categoria_id
+        ]
+        ativas = [equipe for equipe in equipes_categoria if bool(equipe.get("ativa", True))]
+
+        if len(ativas) > alvo:
+            excedentes = len(ativas) - alvo
+            ordenadas = _ordenar_equipes_para_inativacao(
+                ativas,
+                nomes_canonicos_por_categoria.get(categoria_id, set()),
+            )
+            for equipe in ordenadas[:excedentes]:
+                if equipe.get("ativa", True):
+                    equipe["ativa"] = False
+                    alterado = True
+
+        equipes_categoria = [
+            equipe
+            for equipe in banco.get("equipes", [])
+            if str(equipe.get("categoria", "")).strip().lower() == categoria_id
+        ]
+        ativas = [equipe for equipe in equipes_categoria if bool(equipe.get("ativa", True))]
+
+        faltantes = alvo - len(ativas)
+        if faltantes > 0:
+            nomes_existentes = {
+                str(equipe.get("nome", "") or "")
+                for equipe in equipes_categoria
+            }
+            infos_candidatas = list(infos_por_categoria.get(categoria_id, []))
+            infos_ordenadas = sorted(
+                infos_candidatas,
+                key=lambda info: (
+                    0 if str(info.get("nome", "") or "") not in nomes_existentes else 1,
+                    str(info.get("nome", "") or "").casefold(),
+                ),
+            )
+            for idx in range(faltantes):
+                info_base = infos_ordenadas[idx % len(infos_ordenadas)] if infos_ordenadas else {
+                    "nome": f"{categoria_id}_team_{idx + 1}",
+                    "nome_curto": f"{categoria_id[:8]}_{idx + 1}",
+                    "pais": "🌍 Internacional",
+                    "cores": ("#FFFFFF", "#000000"),
+                }
+                info_nova = dict(info_base)
+                nome_base = str(info_nova.get("nome", f"{categoria_id}_team") or f"{categoria_id}_team").strip()
+                nome_final = nome_base
+                sufixo = 2
+                while nome_final in nomes_existentes:
+                    nome_final = f"{nome_base} {sufixo}"
+                    sufixo += 1
+                info_nova["nome"] = nome_final
+                if not info_nova.get("nome_curto"):
+                    info_nova["nome_curto"] = nome_final[:12]
+
+                equipe_nova = criar_equipe_inicial(
+                    banco=banco,
+                    nome_info=info_nova,
+                    categoria_id=categoria_id,
+                    ano_atual=ano_atual,
+                )
+                equipe_nova["ativa"] = True
+                banco["equipes"].append(equipe_nova)
+                nomes_existentes.add(nome_final)
+                alterado = True
+
+    pilotos_dict = [p for p in banco.get("pilotos", []) if isinstance(p, dict)]
+    if len(pilotos_dict) != len(banco.get("pilotos", [])):
+        banco["pilotos"] = pilotos_dict
+        alterado = True
+
+    # Rebalanceia pilotos por categoria para manter 2 por equipe ativa.
+    for categoria_id in categorias_alvo:
+        equipes_ativas = [
+            equipe
+            for equipe in banco.get("equipes", [])
+            if str(equipe.get("categoria", "")).strip().lower() == categoria_id
+            and bool(equipe.get("ativa", True))
+        ]
+        equipes_ativas = sorted(
+            equipes_ativas,
+            key=lambda equipe: (
+                _normalizar_int_positivo(equipe.get("id")) or 0,
+                str(equipe.get("nome", "")).casefold(),
+            ),
+        )
+        capacidade = len(equipes_ativas) * 2
+        if capacidade <= 0:
+            continue
+
+        pilotos_categoria = [
+            piloto
+            for piloto in banco.get("pilotos", [])
+            if str(piloto.get("categoria_atual", "")).strip().lower() == categoria_id
+            and not bool(piloto.get("aposentado", False))
+        ]
+
+        pilotos_ativos = [piloto for piloto in pilotos_categoria if _piloto_ativo_para_grid(piloto)]
+        pilotos_ativos_ordenados = sorted(
+            pilotos_ativos,
+            key=lambda piloto: (
+                0 if bool(piloto.get("is_jogador", False)) else 1,
+                -float(piloto.get("skill", 0) or 0),
+                _normalizar_int_positivo(piloto.get("id")) or 0,
+            ),
+        )
+
+        selecionados = list(pilotos_ativos_ordenados[:capacidade])
+        ids_selecionados = {
+            _normalizar_int_positivo(piloto.get("id")) for piloto in selecionados
+            if _normalizar_int_positivo(piloto.get("id")) is not None
+        }
+
+        for piloto in pilotos_ativos_ordenados[capacidade:]:
+            piloto["status"] = "reserva"
+            piloto["equipe_id"] = None
+            piloto["equipe_nome"] = None
+            piloto["papel"] = None
+            alterado = True
+
+        while len(selecionados) < capacidade:
+            novo_piloto = criar_piloto(
+                banco=banco,
+                categoria_id=categoria_id,
+                ano_atual=ano_atual,
+            )
+            preencher_campos_obrigatorios_piloto(novo_piloto)
+            novo_piloto["status"] = "ativo"
+            novo_piloto["categoria_atual"] = categoria_id
+            novo_piloto["equipe_id"] = None
+            novo_piloto["equipe_nome"] = None
+            novo_piloto["papel"] = None
+            banco["pilotos"].append(novo_piloto)
+            selecionados.append(novo_piloto)
+            piloto_id = _normalizar_int_positivo(novo_piloto.get("id"))
+            if piloto_id is not None:
+                ids_selecionados.add(piloto_id)
+            alterado = True
+
+        for equipe in equipes_ativas:
+            equipe["pilotos"] = []
+            equipe["piloto_numero_1"] = None
+            equipe["piloto_numero_2"] = None
+            equipe["piloto_1"] = None
+            equipe["piloto_2"] = None
+
+        equipes_inativas = [
+            equipe
+            for equipe in banco.get("equipes", [])
+            if str(equipe.get("categoria", "")).strip().lower() == categoria_id
+            and not bool(equipe.get("ativa", True))
+        ]
+        for equipe in equipes_inativas:
+            equipe["pilotos"] = []
+            equipe["piloto_numero_1"] = None
+            equipe["piloto_numero_2"] = None
+            equipe["piloto_1"] = None
+            equipe["piloto_2"] = None
+
+        for indice, piloto in enumerate(selecionados):
+            equipe_alvo = equipes_ativas[indice // 2]
+            piloto_id = _normalizar_int_positivo(piloto.get("id"))
+            if piloto_id is None:
+                continue
+
+            equipe_alvo.setdefault("pilotos", [])
+            equipe_alvo["pilotos"].append(piloto_id)
+            piloto["categoria_atual"] = categoria_id
+            piloto["status"] = "ativo"
+            piloto["equipe_id"] = equipe_alvo.get("id")
+            piloto["equipe_nome"] = equipe_alvo.get("nome")
+            contrato_anos = _normalizar_int_positivo(piloto.get("contrato_anos")) or 0
+            if contrato_anos <= 0:
+                piloto["contrato_anos"] = 1
+            if indice % 2 == 0:
+                piloto["papel"] = "numero_1"
+                equipe_alvo["piloto_numero_1"] = piloto_id
+                equipe_alvo["piloto_1"] = piloto.get("nome")
+            else:
+                piloto["papel"] = "numero_2"
+                equipe_alvo["piloto_numero_2"] = piloto_id
+                equipe_alvo["piloto_2"] = piloto.get("nome")
+
+        ids_equipes_ativas = {
+            _normalizar_int_positivo(equipe.get("id"))
+            for equipe in equipes_ativas
+        }
+        ids_equipes_ativas.discard(None)
+
+        for piloto in pilotos_categoria:
+            piloto_id = _normalizar_int_positivo(piloto.get("id"))
+            if piloto_id in ids_selecionados:
+                continue
+            if _piloto_ativo_para_grid(piloto):
+                piloto["status"] = "reserva"
+            equipe_id = _normalizar_int_positivo(piloto.get("equipe_id"))
+            if equipe_id in ids_equipes_ativas:
+                piloto["equipe_id"] = None
+                piloto["equipe_nome"] = None
+            if str(piloto.get("status", "")).strip().lower() in {"reserva", "reserva_global", "livre"}:
+                piloto["equipe_id"] = None
+                piloto["equipe_nome"] = None
+                piloto["papel"] = None
+
+    return alterado
+
+
 def _mercado_padrao():
     """Estrutura padrao de banco['mercado'] (migracao segura)."""
     return {
@@ -192,9 +682,12 @@ def _mercado_padrao():
             "em_andamento": False,
             "ano_base": 0,
             "aposentados": [],
+            "total_aposentadorias": 0,
             "simulacao_ai_concluida": False,
+            "evolucao_processada": False,
             "promocao_processada": False,
             "relatorio_promocao": {},
+            "validacao_pos_mercado": {},
         },
     }
 
@@ -246,14 +739,23 @@ def _normalizar_mercado(mercado_raw):
         if "aposentados" not in fechamento or not isinstance(fechamento.get("aposentados"), list):
             fechamento["aposentados"] = []
             alterado = True
+        if "total_aposentadorias" not in fechamento:
+            fechamento["total_aposentadorias"] = 0
+            alterado = True
         if "simulacao_ai_concluida" not in fechamento:
             fechamento["simulacao_ai_concluida"] = False
+            alterado = True
+        if "evolucao_processada" not in fechamento:
+            fechamento["evolucao_processada"] = False
             alterado = True
         if "promocao_processada" not in fechamento:
             fechamento["promocao_processada"] = False
             alterado = True
         if "relatorio_promocao" not in fechamento or not isinstance(fechamento.get("relatorio_promocao"), dict):
             fechamento["relatorio_promocao"] = {}
+            alterado = True
+        if "validacao_pos_mercado" not in fechamento or not isinstance(fechamento.get("validacao_pos_mercado"), dict):
+            fechamento["validacao_pos_mercado"] = {}
             alterado = True
         novo_em_andamento = _normalizar_bool(fechamento.get("em_andamento"), False)
         if fechamento.get("em_andamento") != novo_em_andamento:
@@ -272,6 +774,16 @@ def _normalizar_mercado(mercado_raw):
         promocao_proc = _normalizar_bool(fechamento.get("promocao_processada"), False)
         if fechamento.get("promocao_processada") != promocao_proc:
             fechamento["promocao_processada"] = promocao_proc
+            alterado = True
+        total_aposentadorias = _normalizar_int_positivo(fechamento.get("total_aposentadorias"))
+        if total_aposentadorias is None:
+            total_aposentadorias = 0
+        if fechamento.get("total_aposentadorias") != total_aposentadorias:
+            fechamento["total_aposentadorias"] = total_aposentadorias
+            alterado = True
+        evolucao_proc = _normalizar_bool(fechamento.get("evolucao_processada"), False)
+        if fechamento.get("evolucao_processada") != evolucao_proc:
+            fechamento["evolucao_processada"] = evolucao_proc
             alterado = True
 
     versao = _normalizar_int_positivo(mercado.get("versao"))
@@ -458,6 +970,7 @@ def criar_banco_vazio():
         "total_rodadas": 24,
         "temporada_concluida": False,
         "nome_jogador": "",
+        "conteudo_iracing": _conteudo_iracing_padrao(),
         "idade_aposentadoria": 42,
         "dificuldade": "Médio",
         "pilotos_por_categoria": 20,
@@ -543,6 +1056,7 @@ def _validar_campos_banco(banco):
         "total_rodadas": 24,
         "temporada_concluida": False,
         "nome_jogador": "",
+        "conteudo_iracing": _conteudo_iracing_padrao(),
         "idade_aposentadoria": 42,
         "dificuldade": "Médio",
         "pilotos_por_categoria": 20,
@@ -567,6 +1081,30 @@ def _validar_campos_banco(banco):
         if campo not in banco:
             banco[campo] = copy.deepcopy(valor_padrao)
             alterado = True
+
+    dificuldade_raw = str(banco.get("dificuldade", "Médio") or "").strip()
+    aliases_dificuldade = {
+        "Fácil": "Fácil",
+        "Médio": "Médio",
+        "Difícil": "Difícil",
+        "Lendário": "Lendário",
+        # Compatibilidade com valores legados salvos com mojibake.
+        "F\u00c3\u00a1cil": "Fácil",
+        "M\u00c3\u00a9dio": "Médio",
+        "Dif\u00c3\u00adcil": "Difícil",
+        "Lend\u00c3\u00a1rio": "Lendário",
+    }
+    dificuldade_normalizada = aliases_dificuldade.get(dificuldade_raw, dificuldade_raw)
+    if dificuldade_normalizada not in DIFICULDADES:
+        dificuldade_normalizada = "Médio"
+    if banco.get("dificuldade") != dificuldade_normalizada:
+        banco["dificuldade"] = dificuldade_normalizada
+        alterado = True
+
+    conteudo_normalizado = _normalizar_conteudo_iracing(banco.get("conteudo_iracing"))
+    if banco.get("conteudo_iracing") != conteudo_normalizado:
+        banco["conteudo_iracing"] = conteudo_normalizado
+        alterado = True
 
     campos_lista = (
         "pilotos",
@@ -665,6 +1203,15 @@ def _validar_campos_banco(banco):
         alterado = True
 
     if _normalizar_ids_categoria_banco(banco):
+        alterado = True
+
+    if _migrar_schema_pilotos(banco):
+        alterado = True
+
+    if _migrar_potencial_por_atributos(banco):
+        alterado = True
+
+    if _migrar_pool_equipes_canonico(banco):
         alterado = True
 
     return banco, alterado

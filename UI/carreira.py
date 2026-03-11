@@ -1,4 +1,4 @@
-﻿"""
+"""
 Tela principal da carreira - Dashboard
 """
 
@@ -70,6 +70,8 @@ from UI.carreira_acoes_simular import SimularMixin
 from UI.carreira_acoes_temporada import TemporadaMixin
 from UI.carreira_acoes_config import ConfigMixin
 from UI.carreira_acoes_mercado import MercadoMixin
+
+from UI.ux_helpers import UXMixin, SimulacaoUXMixin, DashboardUXMixin
 
 from Dados.constantes import CATEGORIAS, NOMES_CAMPEONATO, PONTOS_POR_POSICAO
 from Dados.banco import carregar_banco, salvar_banco
@@ -723,6 +725,9 @@ class TelaCarreira(
     TemporadaMixin,
     MercadoMixin,
     ConfigMixin,
+    UXMixin,
+    SimulacaoUXMixin,
+    DashboardUXMixin,
 ):
     """Dashboard principal da carreira."""
 
@@ -765,7 +770,19 @@ class TelaCarreira(
             self.banco,
             self.categoria_atual,
         )
-        if ajustes_grid:
+
+        precisa_hierarquia_inicial = any(
+            isinstance(equipe, dict)
+            and bool(equipe.get("ativa", True))
+            and isinstance(equipe.get("pilotos"), list)
+            and len(equipe.get("pilotos", [])) == 2
+            and not isinstance(equipe.get("hierarquia"), dict)
+            for equipe in self.banco.get("equipes", [])
+        )
+        if precisa_hierarquia_inicial:
+            self._inicializar_hierarquias(self.banco)
+
+        if ajustes_grid or precisa_hierarquia_inicial:
             salvar_banco(self.banco)
 
         self.setWindowTitle("🏁 Modo Carreira")
@@ -776,7 +793,9 @@ class TelaCarreira(
 
         self._build_ui()
         self._configurar_controles_fullscreen()
-        self._atualizar_tudo()
+        self._configurar_atalhos()
+        self._setup_ux()
+        self._atualizar_tudo(animar=True)
         self._iniciar_monitor_resultados()
 
     # ============================================================
@@ -1315,6 +1334,9 @@ class TelaCarreira(
     def _configurar_pastas(self):
         return self._delegar_mixin(ConfigMixin, "_configurar_pastas")
 
+    def _configurar_conteudo_iracing(self):
+        return self._delegar_mixin(ConfigMixin, "_configurar_conteudo_iracing")
+
     def _exportar_roster(self, silencioso: bool = False):
         return self._delegar_mixin(ExportarImportarMixin, "_exportar_roster", silencioso=silencioso)
 
@@ -1341,6 +1363,24 @@ class TelaCarreira(
 
     def _finalizar_temporada(self):
         return self._delegar_mixin(TemporadaMixin, "_finalizar_temporada")
+
+    def _configurar_atalhos(self):
+        from PySide6.QtGui import QKeySequence, QShortcut
+
+        atalhos_map = {
+            "Ctrl+1": lambda: self._mostrar_aba(0),
+            "Ctrl+2": lambda: self._mostrar_aba(1),
+            "Ctrl+3": lambda: self._mostrar_aba(2),
+            "Ctrl+4": lambda: self._mostrar_aba(3),
+            "Ctrl+5": lambda: self._mostrar_aba(4),
+            "Ctrl+Page Up": lambda: self._navegar_categoria(-1),
+            "Ctrl+Page Down": lambda: self._navegar_categoria(1),
+        }
+        self._atalhos_salvos = []
+        for seq, callback in atalhos_map.items():
+            atalho = QShortcut(QKeySequence(seq), self)
+            atalho.activated.connect(callback)
+            self._atalhos_salvos.append(atalho)
 
     # ============================================================
     # MONITOR DE RESULTADOS
@@ -1492,6 +1532,9 @@ class TelaCarreira(
                 return 0
 
             calcular_pontos_equipes(self.banco, self.categoria_atual)
+            simular_paralelo = getattr(self, "_simular_rodada_todas_categorias", None)
+            if callable(simular_paralelo):
+                simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
             self._avancar_rodada()
         finally:
             self.categoria_atual = categoria_original
@@ -1625,6 +1668,13 @@ class TelaCarreira(
         content_layout.addWidget(self._build_conteudo(), stretch=1)
 
         root_layout.addWidget(content_container, stretch=1)
+
+        self.status_bar = self.statusBar()
+        self.status_bar.setStyleSheet(
+            f"background-color: {Cores.FUNDO_APP}; color: {Cores.TEXTO_SECONDARY}; "
+            f"border-top: 1px solid {Cores.BORDA};"
+        )
+        self.status_bar.showMessage("Pronto")
 
     def _build_top_navigation(self):
         header = QFrame()
@@ -1783,6 +1833,13 @@ class TelaCarreira(
         btn_config.clicked.connect(self._configurar_pastas)
         btn_config.setFixedSize(36, 34)
 
+        btn_conteudo = QPushButton("\U0001F4E6")
+        btn_conteudo.setObjectName("btn_config_pastas")
+        btn_conteudo.setCursor(Qt.PointingHandCursor)
+        btn_conteudo.setToolTip("Conteudo iRacing")
+        btn_conteudo.clicked.connect(self._configurar_conteudo_iracing)
+        btn_conteudo.setFixedSize(36, 34)
+
         self._top_right_widget = QWidget()
         self._top_right_recuo_max = 154
         self._recuo_controles_topo_atual = int(getattr(self, "_recuo_controles_topo_atual", 0))
@@ -1812,8 +1869,10 @@ class TelaCarreira(
         nav_categoria_layout.addWidget(btn_cat_down)
 
         self._btn_config_top = btn_config
+        self._btn_conteudo_top = btn_conteudo
         grupo_layout.addWidget(self.combo_categoria)
         grupo_layout.addWidget(nav_categoria)
+        grupo_layout.addWidget(self._btn_conteudo_top)
         grupo_layout.addWidget(self._btn_config_top)
 
         self._grupo_categoria_top.adjustSize()
@@ -1821,6 +1880,7 @@ class TelaCarreira(
         controles_altura = max(
             self.combo_categoria.sizeHint().height(),
             nav_categoria.sizeHint().height(),
+            self._btn_conteudo_top.sizeHint().height(),
             self._btn_config_top.sizeHint().height(),
         )
         self._grupo_categoria_top.setFixedSize(controles_largura, controles_altura)
@@ -3280,6 +3340,24 @@ class TelaCarreira(
 
         card_equipe.add(Separador())
 
+        lbl_dinamica = QLabel("DINAMICA INTERNA")
+        lbl_dinamica.setFont(Fontes.label_campo())
+        lbl_dinamica.setStyleSheet(
+            f"color: {Cores.TEXTO_MUTED}; border: none; background: transparent;"
+        )
+        card_equipe.add(lbl_dinamica)
+
+        self.info_dinamica_n1 = LinhaInfo("Piloto N1", "-")
+        self.info_dinamica_n2 = LinhaInfo("Piloto N2", "-")
+        self.info_dinamica_status = LinhaInfo("Status", "-")
+        self.info_dinamica_detalhe = LinhaInfo("Detalhe", "-")
+        card_equipe.add(self.info_dinamica_n1)
+        card_equipe.add(self.info_dinamica_n2)
+        card_equipe.add(self.info_dinamica_status)
+        card_equipe.add(self.info_dinamica_detalhe)
+
+        card_equipe.add(Separador())
+
         self.info_pts_equipe = LinhaInfo("Pontos", "0")
         self.info_vit_equipe = LinhaInfo("Vitórias", "0")
         card_equipe.add(self.info_pts_equipe)
@@ -4244,17 +4322,13 @@ class TelaCarreira(
         return item
 
     def _simular_classificacao(self):
-        QMessageBox.information(
-            self,
-            "Info",
-            "Classificação ainda não implementada.\nUse 'Simular Corrida' diretamente.",
-        )
+        return self._delegar_mixin(SimularMixin, "_simular_classificacao")
 
     # ============================================================
     # ATUALIZAÇÕES
     # ============================================================
 
-    def _atualizar_tudo(self):
+    def _atualizar_tudo(self, animar: bool = False):
         if sincronizar_production_car_challenge(self.banco):
             salvar_banco(self.banco)
         self._atualizar_info_temporada()
@@ -4266,6 +4340,9 @@ class TelaCarreira(
         self._atualizar_minha_equipe()
         self._atualizar_previsao_campeonato()
         self._atualizar_aba_mercado()
+
+        if animar and getattr(self, "_ux_initialized", False):
+            QTimer.singleShot(100, self._animar_entrada_dashboard)
 
     def _atualizar_info_temporada(self):
         ano = int(self.banco.get("ano_atual", 2024))
@@ -5347,6 +5424,10 @@ class TelaCarreira(
             self.bar_confiab.set_valor(0)
             self.info_piloto_1.set_valor("-")
             self.info_piloto_2.set_valor("-")
+            self.info_dinamica_n1.set_valor("-")
+            self.info_dinamica_n2.set_valor("-")
+            self.info_dinamica_status.set_valor("-")
+            self.info_dinamica_detalhe.set_valor("-")
             self.info_pts_equipe.set_valor("0")
             self.info_vit_equipe.set_valor("0")
             return
@@ -5397,6 +5478,57 @@ class TelaCarreira(
 
         self.info_piloto_1.set_valor(equipe_data.get("piloto_1", "-") or "-")
         self.info_piloto_2.set_valor(equipe_data.get("piloto_2", "-") or "-")
+
+        pilotos_por_id = {
+            str(piloto.get("id")): piloto
+            for piloto in self.banco.get("pilotos", [])
+            if isinstance(piloto, dict)
+        }
+        hierarquia = equipe_data.get("hierarquia")
+        if not isinstance(hierarquia, dict):
+            hierarquia = {}
+
+        n1_id = str(hierarquia.get("n1_id", equipe_data.get("piloto_numero_1")) or "")
+        n2_id = str(hierarquia.get("n2_id", equipe_data.get("piloto_numero_2")) or "")
+        piloto_n1 = pilotos_por_id.get(n1_id, {})
+        piloto_n2 = pilotos_por_id.get(n2_id, {})
+
+        nome_n1 = str(piloto_n1.get("nome", equipe_data.get("piloto_1", "-")) or "-")
+        nome_n2 = str(piloto_n2.get("nome", equipe_data.get("piloto_2", "-")) or "-")
+        try:
+            skill_n1 = int(float(piloto_n1.get("skill", 0) or 0))
+        except (TypeError, ValueError):
+            skill_n1 = 0
+        try:
+            skill_n2 = int(float(piloto_n2.get("skill", 0) or 0))
+        except (TypeError, ValueError):
+            skill_n2 = 0
+
+        self.info_dinamica_n1.set_valor(f"{nome_n1} (skill {skill_n1})")
+        self.info_dinamica_n2.set_valor(f"{nome_n2} (skill {skill_n2})")
+
+        status_hierarquia = str(hierarquia.get("status", "estavel") or "estavel").strip().lower()
+        corridas_n2 = int(hierarquia.get("corridas_n2_a_frente", 0) or 0)
+        rodada_evento = hierarquia.get("ultima_reavaliacao", "-")
+
+        mapa_status = {
+            "estavel": "Estavel",
+            "tensao": "⚡ Tensao",
+            "reavaliacao": "🔎 Reavaliacao",
+            "invertido": "🔄 Invertido",
+        }
+        status_legivel = mapa_status.get(status_hierarquia, status_hierarquia or "-")
+        if status_hierarquia == "tensao":
+            detalhe = f"N2 esta a frente por {corridas_n2} corrida(s) consecutiva(s)."
+        elif status_hierarquia == "invertido":
+            detalhe = f"Hierarquia invertida na rodada {rodada_evento}."
+        elif status_hierarquia == "reavaliacao":
+            detalhe = f"Reavaliacao em curso ({corridas_n2} corridas com N2 a frente)."
+        else:
+            detalhe = "Sem tensao interna no momento."
+
+        self.info_dinamica_status.set_valor(status_legivel)
+        self.info_dinamica_detalhe.set_valor(detalhe)
         self.info_pts_equipe.set_valor(str(equipe_data.get("pontos_temporada", 0)))
         self.info_vit_equipe.set_valor(str(equipe_data.get("vitorias_temporada", 0)))
 
@@ -5569,7 +5701,13 @@ class TelaCarreira(
 
     def _mostrar_aba(self, indice):
         if hasattr(self, "tabs") and 0 <= indice < self.tabs.count():
-            self.tabs.setCurrentIndex(indice)
+            if getattr(self, "_ux_initialized", False) and hasattr(self, "transicao_para_aba"):
+                self.transicao_para_aba(indice)
+                self._atualizar_navegacao_ativa()
+            else:
+                self.tabs.setCurrentIndex(indice)
+                self._atualizar_navegacao_ativa()
+            return
         self._atualizar_navegacao_ativa()
 
     def _atualizar_navegacao_ativa(self, *_):
@@ -5580,5 +5718,3 @@ class TelaCarreira(
         indice_ativo = self.tabs.currentIndex()
         for indice, botao in enumerate(botoes):
             botao.setChecked(indice == indice_ativo)
-
-

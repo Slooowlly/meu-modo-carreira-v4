@@ -3,7 +3,9 @@
 from __future__ import annotations
 
 from dataclasses import asdict
+from enum import Enum
 from typing import Any, Dict, List, Optional, Tuple
+import random
 
 from Logica.equipes import promover_equipe, rebaixar_equipe
 
@@ -29,6 +31,7 @@ from .models import (
 from .regras import (
     canonicalizar_categoria_id,
     get_regra_categoria,
+    get_regras_rebaixamento_por_grupo,
     get_todas_categorias,
     resolver_destino_rebaixamento_production,
 )
@@ -101,7 +104,11 @@ class PromocaoManager:
         return avaliacoes
 
     def _detectar_rebaixamentos_endurance(self, equipes_endurance: List[Any]) -> List[Tuple[Any, str]]:
-        por_classe: Dict[str, List[Tuple[Any, ResultadoTemporada]]] = {"gt3": [], "gt4": []}
+        regras_por_classe = get_regras_rebaixamento_por_grupo("endurance")
+        por_classe: Dict[str, List[Tuple[Any, ResultadoTemporada]]] = {
+            classe: []
+            for classe in regras_por_classe.keys()
+        }
 
         for equipe in equipes_endurance:
             equipe_id = str(self._get(equipe, "id", str(id(equipe))))
@@ -118,6 +125,11 @@ class PromocaoManager:
         for classe, items in por_classe.items():
             if not items:
                 continue
+            regra_classe = regras_por_classe.get(classe, {})
+            qtd_descem = max(0, int(regra_classe.get("descem", 0) or 0))
+            destino = str(regra_classe.get("origem") or "").strip().lower()
+            if qtd_descem <= 0 or not destino:
+                continue
             piores = sorted(
                 items,
                 key=lambda par: (
@@ -125,23 +137,17 @@ class PromocaoManager:
                     -int(par[1].posicao_construtores),
                     str(self._get(par[0], "nome", "")).casefold(),
                 ),
-            )[:3]
-            destino = "gt3" if classe == "gt3" else "gt4"
+            )[:qtd_descem]
             for equipe, _resultado in piores:
                 rebaixar.append((equipe, destino))
 
         return rebaixar
 
     def _detectar_rebaixamentos_production(self, equipes_production: List[Any]) -> List[Tuple[Any, str]]:
+        regras_por_marca = get_regras_rebaixamento_por_grupo("production_challenger")
         por_classe: Dict[str, List[Tuple[Any, ResultadoTemporada]]] = {
-            "mazda": [],
-            "toyota": [],
-            "bmw_m2": [],
-        }
-        destino_por_classe = {
-            "mazda": "mazda_amador",
-            "toyota": "toyota_amador",
-            "bmw_m2": "bmw_m2",
+            marca: []
+            for marca in regras_por_marca.keys()
         }
 
         for equipe in equipes_production:
@@ -150,7 +156,11 @@ class PromocaoManager:
             if not resultado:
                 continue
 
-            classe = str(self._get(equipe, "carro_classe", "")).strip().lower()
+            classe = str(
+                self._get(equipe, "pro_trilha_marca", self._get(equipe, "carro_classe", ""))
+            ).strip().lower()
+            if classe == "bmw_m2":
+                classe = "bmw"
             if classe not in por_classe:
                 continue
             por_classe[classe].append((equipe, resultado))
@@ -159,6 +169,11 @@ class PromocaoManager:
         for classe, items in por_classe.items():
             if not items:
                 continue
+            regra_marca = regras_por_marca.get(classe, {})
+            qtd_descem = max(0, int(regra_marca.get("descem", 0) or 0))
+            destino = str(regra_marca.get("origem") or "").strip().lower()
+            if qtd_descem <= 0 or not destino:
+                continue
             piores = sorted(
                 items,
                 key=lambda par: (
@@ -166,11 +181,7 @@ class PromocaoManager:
                     -int(par[1].posicao_construtores),
                     str(self._get(par[0], "nome", "")).casefold(),
                 ),
-            )[:3]
-
-            destino = destino_por_classe.get(classe)
-            if not destino:
-                continue
+            )[:qtd_descem]
             for equipe, _resultado in piores:
                 rebaixar.append((equipe, destino))
 
@@ -201,6 +212,72 @@ class PromocaoManager:
                 if self._get(equipe, "categoria", "") != "endurance":
                     self._set(equipe, "classe_endurance", None)
 
+    def _ajustar_equipe_promovida_para_base_da_categoria(
+        self,
+        equipe: Any,
+        categoria_destino: str,
+        banco: Optional[dict],
+    ) -> None:
+        """
+        M8: equipe promovida inicia como uma das mais fracas da nova categoria.
+        """
+        if banco is None or not isinstance(equipe, dict):
+            return
+
+        categoria_norm = canonicalizar_categoria_id(categoria_destino)
+        equipes_destino: list[dict[str, Any]] = []
+        for item in banco.get("equipes", []):
+            if not isinstance(item, dict):
+                continue
+            if str(item.get("id")) == str(equipe.get("id")):
+                continue
+            categoria_item = canonicalizar_categoria_id(
+                str(item.get("categoria", item.get("categoria_id", "")) or "")
+            )
+            if categoria_item != categoria_norm:
+                continue
+            equipes_destino.append(item)
+
+        if not equipes_destino:
+            return
+
+        if categoria_norm == "production_challenger":
+            marca_promovida = str(
+                equipe.get("pro_trilha_marca", equipe.get("carro_classe", ""))
+            ).strip().lower().replace("bmw_m2", "bmw")
+            if marca_promovida:
+                equipes_destino = [
+                    item for item in equipes_destino
+                    if str(
+                        item.get("pro_trilha_marca", item.get("carro_classe", ""))
+                    ).strip().lower().replace("bmw_m2", "bmw") == marca_promovida
+                ] or equipes_destino
+        elif categoria_norm == "endurance":
+            classe_promovida = str(equipe.get("classe_endurance", "") or "").strip().lower()
+            if classe_promovida:
+                equipes_destino = [
+                    item for item in equipes_destino
+                    if str(item.get("classe_endurance", "") or "").strip().lower() == classe_promovida
+                ] or equipes_destino
+
+        perfs = []
+        for item in equipes_destino:
+            try:
+                perfs.append(float(item.get("car_performance", 50) or 50))
+            except (TypeError, ValueError):
+                continue
+        if not perfs:
+            return
+
+        minimo = min(perfs)
+        media = sum(perfs) / len(perfs)
+        teto = max(minimo, media - 5.0)
+        if teto <= minimo:
+            novo = minimo
+        else:
+            novo = random.uniform(minimo, teto)
+        equipe["car_performance"] = round(max(30.0, min(100.0, float(novo))), 2)
+
     def _processar_promocao(
         self,
         relatorio: RelatorioPromocao,
@@ -208,6 +285,7 @@ class PromocaoManager:
         avaliacao: AvaliacaoEquipe,
         temporada: int,
         aplicar_automaticamente: bool,
+        banco: Optional[dict] = None,
     ):
         regra_destino = get_regra_categoria(avaliacao.categoria_destino or "")
         tier_destino = int(regra_destino.tier if regra_destino else 1)
@@ -231,6 +309,11 @@ class PromocaoManager:
         if aplicar_automaticamente:
             self._aplicar_movimentacao_categoria(equipe, TipoMovimentacao.PROMOCAO, str(avaliacao.categoria_destino or ""))
             aplicar_consequencias(equipe, consequencias)
+            self._ajustar_equipe_promovida_para_base_da_categoria(
+                equipe=equipe,
+                categoria_destino=str(avaliacao.categoria_destino or ""),
+                banco=banco,
+            )
 
         relatorio.adicionar_destaque(
             f"{avaliacao.equipe_nome} promovida para {avaliacao.categoria_destino}."
@@ -333,6 +416,7 @@ class PromocaoManager:
                 avaliacao=avaliacao,
                 temporada=int(temporada),
                 aplicar_automaticamente=aplicar_automaticamente,
+                banco=banco,
             )
 
         # Optional invitations for non-gt3/gt4 categories.
@@ -388,6 +472,11 @@ class PromocaoManager:
             if aplicar_automaticamente:
                 self._aplicar_movimentacao_categoria(equipe, TipoMovimentacao.PROMOCAO, convite.categoria_destino_id)
                 aplicar_consequencias(equipe, consequencias)
+                self._ajustar_equipe_promovida_para_base_da_categoria(
+                    equipe=equipe,
+                    categoria_destino=convite.categoria_destino_id,
+                    banco=banco,
+                )
             relatorio.adicionar_destaque(
                 f"{convite.equipe_nome} aceitou convite para {convite.categoria_destino_id}."
             )
@@ -519,7 +608,11 @@ def processar_promocoes_simples(
     categoria_id: str,
 ) -> Tuple[List[Any], List[Any]]:
     _ = temporada
-    from .regras import get_vagas_promocao, get_vagas_rebaixamento
+    from .regras import (
+        get_regras_rebaixamento_por_grupo,
+        get_vagas_promocao,
+        get_vagas_rebaixamento,
+    )
 
     vagas_promo = get_vagas_promocao(categoria_id)
     vagas_rebaixa = get_vagas_rebaixamento(categoria_id)
@@ -533,27 +626,41 @@ def processar_promocoes_simples(
     )
 
     if categoria_norm == "production_challenger":
+        regras_por_marca = get_regras_rebaixamento_por_grupo("production_challenger")
         rebaixadas: List[Any] = []
-        for classe in ("mazda", "toyota", "bmw_m2"):
+        for marca, regra in regras_por_marca.items():
+            qtd_descem = max(0, int(regra.get("descem", 0) or 0))
+            if qtd_descem <= 0:
+                continue
             equipes_classe = [
                 equipe for equipe in equipes_ordenadas
-                if str(PromocaoManager._get(equipe, "carro_classe", "")).strip().lower() == classe
+                if str(
+                    PromocaoManager._get(
+                        equipe,
+                        "pro_trilha_marca",
+                        PromocaoManager._get(equipe, "carro_classe", ""),
+                    )
+                ).strip().lower().replace("bmw_m2", "bmw") == marca
             ]
             if not equipes_classe:
                 continue
-            rebaixadas.extend(equipes_classe[-3:])
+            rebaixadas.extend(equipes_classe[-qtd_descem:])
         return [], rebaixadas
 
     if categoria_norm == "endurance":
+        regras_por_classe = get_regras_rebaixamento_por_grupo("endurance")
         rebaixadas = []
-        for classe in ("gt3", "gt4"):
+        for classe, regra in regras_por_classe.items():
+            qtd_descem = max(0, int(regra.get("descem", 0) or 0))
+            if qtd_descem <= 0:
+                continue
             equipes_classe = [
                 equipe for equipe in equipes_ordenadas
                 if str(PromocaoManager._get(equipe, "classe_endurance", "")).strip().lower() == classe
             ]
             if not equipes_classe:
                 continue
-            rebaixadas.extend(equipes_classe[-3:])
+            rebaixadas.extend(equipes_classe[-qtd_descem:])
         return [], rebaixadas
 
     promovidas = equipes_ordenadas[:vagas_promo]
@@ -598,4 +705,15 @@ def aplicar_rebaixamento_simples(equipe: Any, categoria_destino: str):
 
 
 def relatorio_to_dict(relatorio: RelatorioPromocao) -> dict:
-    return asdict(relatorio)
+    def _serializar(valor: Any) -> Any:
+        if isinstance(valor, Enum):
+            return valor.value
+        if isinstance(valor, dict):
+            return {chave: _serializar(item) for chave, item in valor.items()}
+        if isinstance(valor, list):
+            return [_serializar(item) for item in valor]
+        if isinstance(valor, tuple):
+            return tuple(_serializar(item) for item in valor)
+        return valor
+
+    return _serializar(asdict(relatorio))

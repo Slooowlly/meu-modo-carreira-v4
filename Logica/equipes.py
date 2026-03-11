@@ -20,6 +20,39 @@ logger = logging.getLogger(__name__)
 
 
 # ============================================================
+# HELPERS
+# ============================================================
+
+def _normalizar_marca_trilha_pro(valor):
+    """Normaliza identificador da marca da trilha PRO."""
+    marca = str(valor or "").strip().lower()
+    if marca == "bmw_m2":
+        return "bmw"
+    if marca in {"mazda", "toyota", "bmw"}:
+        return marca
+    return ""
+
+
+def _inferir_marca_trilha_pro_por_categoria(categoria_id):
+    """Infere marca da trilha PRO a partir da categoria de origem."""
+    categoria = str(categoria_id or "").strip().lower()
+    if categoria.startswith("mazda"):
+        return "mazda"
+    if categoria.startswith("toyota"):
+        return "toyota"
+    if categoria == "bmw_m2":
+        return "bmw"
+    return ""
+
+
+def _equipe_ativa(equipe):
+    """Retorna True quando a equipe deve ser considerada ativa no campeonato."""
+    if not isinstance(equipe, dict):
+        return False
+    return bool(equipe.get("ativa", True))
+
+
+# ============================================================
 # CRIAÇÃO — EQUIPES FIXAS
 # ============================================================
 
@@ -40,6 +73,11 @@ def criar_equipe_inicial(banco, nome_info, categoria_id, ano_atual):
     cfg = CATEGORIAS_CONFIG.get(categoria_id, {})
     nivel = cfg.get("nivel", "amador")
     cores = nome_info.get("cores", ("#FFFFFF", "#000000"))
+    carro_classe = nome_info.get("carro_classe")
+    classe_endurance = nome_info.get("classe_endurance")
+    pro_trilha_marca = _normalizar_marca_trilha_pro(
+        nome_info.get("pro_trilha_marca", carro_classe)
+    )
 
     equipe = {
         # Identificação
@@ -58,8 +96,10 @@ def criar_equipe_inicial(banco, nome_info, categoria_id, ano_atual):
 
         # Marca / classe (depende da categoria)
         "marca":            nome_info.get("marca"),
-        "carro_classe":     nome_info.get("carro_classe"),
-        "classe_endurance": nome_info.get("classe_endurance"),
+        "carro_classe":     carro_classe,
+        "pro_trilha_marca": pro_trilha_marca or None,
+        "classe_endurance": classe_endurance,
+        "ativa":            True,
 
         # Pilotos
         "pilotos":          [],
@@ -203,8 +243,12 @@ def obter_equipe_piloto(banco, piloto):
 
 
 def obter_equipes_categoria(banco, categoria_id):
-    """Retorna todas as equipes de uma categoria."""
-    return [e for e in banco.get("equipes", []) if e.get("categoria") == categoria_id]
+    """Retorna equipes ativas de uma categoria."""
+    return [
+        equipe
+        for equipe in banco.get("equipes", [])
+        if equipe.get("categoria") == categoria_id and _equipe_ativa(equipe)
+    ]
 
 
 def obter_classificacao_equipes(banco, categoria_id):
@@ -278,6 +322,27 @@ def promover_equipe(equipe, nova_categoria):
     equipe["temporadas_na_categoria"] = 0
     equipe["expectativa"] = "Sem expectativa definida"
     equipe["expectativa_posicao"] = None
+    equipe["ativa"] = True
+
+    if nova_categoria == "production_challenger":
+        marca_pro = _normalizar_marca_trilha_pro(
+            equipe.get("pro_trilha_marca")
+            or equipe.get("carro_classe")
+            or _inferir_marca_trilha_pro_por_categoria(cat_anterior)
+        )
+        if marca_pro:
+            equipe["pro_trilha_marca"] = marca_pro
+            equipe["carro_classe"] = "bmw_m2" if marca_pro == "bmw" else marca_pro
+        equipe["classe_endurance"] = None
+    elif nova_categoria == "endurance":
+        classe = str(equipe.get("classe_endurance", "") or "").strip().lower()
+        if classe not in {"gt3", "gt4", "lmp2"}:
+            origem = str(cat_anterior or "").strip().lower()
+            if origem in {"gt3", "gt4"}:
+                classe = origem
+            else:
+                classe = "gt3"
+        equipe["classe_endurance"] = classe
 
     # Bônus moral por promoção
     equipe["morale"] = min(1.3, equipe.get("morale", 1.0) + 0.1)
@@ -304,6 +369,20 @@ def rebaixar_equipe(equipe, nova_categoria):
     equipe["temporadas_na_categoria"] = 0
     equipe["expectativa"] = "Sem expectativa definida"
     equipe["expectativa_posicao"] = None
+    equipe["ativa"] = True
+
+    if nova_categoria == "production_challenger":
+        marca_pro = _normalizar_marca_trilha_pro(
+            equipe.get("pro_trilha_marca")
+            or equipe.get("carro_classe")
+            or _inferir_marca_trilha_pro_por_categoria(cat_anterior)
+        )
+        if marca_pro:
+            equipe["pro_trilha_marca"] = marca_pro
+            equipe["carro_classe"] = "bmw_m2" if marca_pro == "bmw" else marca_pro
+        equipe["classe_endurance"] = None
+    elif cat_anterior == "endurance" and nova_categoria in {"gt3", "gt4"}:
+        equipe["classe_endurance"] = None
 
     # Penalidade moral por rebaixamento
     equipe["morale"] = max(0.7, equipe.get("morale", 1.0) - 0.15)
@@ -674,7 +753,9 @@ def migrar_equipe_schema_antigo(equipe):
         "temporadas_na_categoria": 0,
         "marca":                 None,
         "carro_classe":          None,
+        "pro_trilha_marca":      None,
         "classe_endurance":      None,
+        "ativa":                 True,
         "piloto_numero_1":       None,
         "piloto_numero_2":       None,
         "car_performance":       equipe.get("performance", 50),
@@ -701,6 +782,20 @@ def migrar_equipe_schema_antigo(equipe):
     for campo, valor in defaults.items():
         if campo not in equipe:
             equipe[campo] = valor
+
+    equipe["ativa"] = bool(equipe.get("ativa", True))
+
+    categoria = str(equipe.get("categoria", "") or "").strip().lower()
+    marca_trilha = _normalizar_marca_trilha_pro(
+        equipe.get("pro_trilha_marca")
+        or equipe.get("carro_classe")
+    )
+    if categoria == "production_challenger":
+        if marca_trilha:
+            equipe["pro_trilha_marca"] = marca_trilha
+            equipe["carro_classe"] = "bmw_m2" if marca_trilha == "bmw" else marca_trilha
+        else:
+            equipe["pro_trilha_marca"] = None
 
     return equipe
 
@@ -803,7 +898,7 @@ def evolucionar_equipes(banco):
     - Atualiza car_performance e chance_dnf
     - Calcula expectativa para o próximo ano
     """
-    print("  🔧 Evoluindo equipes...")
+    print("  [EQUIPES] Evoluindo equipes...")
 
     equipes = banco.get("equipes", [])
     if not equipes:

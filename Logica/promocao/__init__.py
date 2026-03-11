@@ -26,6 +26,7 @@ from .regras import (
     pode_ser_rebaixada,
     get_todas_categorias,
     get_categorias_por_tier,
+    get_regras_rebaixamento_por_grupo,
 )
 from .avaliacao import (
     AvaliacaoEquipe,
@@ -84,6 +85,7 @@ __all__ = [
     "pode_ser_rebaixada",
     "get_todas_categorias",
     "get_categorias_por_tier",
+    "get_regras_rebaixamento_por_grupo",
     "AvaliacaoEquipe",
     "criar_resultado_temporada",
     "avaliar_equipe",

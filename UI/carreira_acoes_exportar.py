@@ -5,6 +5,7 @@ import os
 import random
 import string
 import uuid
+from typing import Any
 
 from PySide6.QtWidgets import (
     QFileDialog,
@@ -482,6 +483,333 @@ class ExportarImportarMixin:
         "mercedesamggt4": "Mercedes-AMG GT4",
         "porsche718gt4": "Porsche 718 Cayman GT4",
     }
+    CLIMA_MAP_M5 = {
+        "seco": None,
+        "nublado": None,
+        "chuva leve": "DAMP",
+        "chuva": "WET",
+        "chuva moderada": "WET",
+        "chuva forte": "HEAVY_RAIN",
+        "tempestade": "HEAVY_RAIN",
+        "dry": None,
+        "damp": "DAMP",
+        "wet": "WET",
+        "heavy rain": "HEAVY_RAIN",
+        "heavy_rain": "HEAVY_RAIN",
+    }
+    # Mapeamento inicial de pais por circuito para ativar "corrida em casa".
+    # TODO: expandir conforme novos circuitos forem usados.
+    PAIS_POR_TRACK_ID = {
+        8: "eua",
+        24: "eua",
+        53: "inglaterra",
+        101: "franca",
+        110: "alemanha",
+        129: "italia",
+    }
+
+    @staticmethod
+    def _to_int(valor: Any, padrao: int = 0) -> int:
+        try:
+            return int(valor)
+        except (TypeError, ValueError):
+            return int(padrao)
+
+    @staticmethod
+    def _normalizar_valor_iracing(valor: Any, padrao: int = 50) -> int:
+        try:
+            numero = int(round(float(valor)))
+        except (TypeError, ValueError):
+            numero = int(padrao)
+        return max(0, min(100, numero))
+
+    def _normalizar_clima_para_m5(self, clima_raw: Any) -> str | None:
+        if clima_raw in (None, "", "-", "None"):
+            return None
+        chave = str(clima_raw).strip().casefold()
+        if chave in {"damp", "wet", "heavy_rain"}:
+            return chave.upper()
+        return self.CLIMA_MAP_M5.get(chave, None)
+
+    def _resolver_dados_corrida_export(self) -> dict:
+        rodada_atual = self._to_int(self.banco.get("rodada_atual", 1), 1)
+        calendario = self.banco.get("calendario", [])
+        total_corridas = len(calendario) if isinstance(calendario, list) and calendario else 10
+
+        corrida = {}
+        indice = rodada_atual - 1
+        if isinstance(calendario, list) and 0 <= indice < len(calendario):
+            corrida = calendario[indice] or {}
+        if not isinstance(corrida, dict):
+            corrida = {}
+
+        track_id = (
+            corrida.get("trackId")
+            or corrida.get("id")
+            or corrida.get("track_id")
+            or 0
+        )
+        track_name = (
+            corrida.get("circuito")
+            or corrida.get("nome")
+            or corrida.get("track_name")
+            or "Unknown Track"
+        )
+        clima_exibicao = str(corrida.get("clima", "Seco") or "Seco").strip()
+        clima_m5 = self._normalizar_clima_para_m5(clima_exibicao)
+
+        return {
+            "rodada_atual": rodada_atual,
+            "total_corridas": total_corridas,
+            "corrida": corrida,
+            "track_id": track_id,
+            "track_name": str(track_name),
+            "clima_exibicao": clima_exibicao,
+            "clima_m5": clima_m5,
+        }
+
+    def _resolver_ids_rivais(self, piloto: dict) -> list[str]:
+        rivalidades = piloto.get("rivalidades", [])
+        if not isinstance(rivalidades, list):
+            return []
+
+        rival_ids: list[str] = []
+        for rivalidade in rivalidades:
+            if isinstance(rivalidade, dict):
+                rival_id = rivalidade.get("rival_id", rivalidade.get("piloto_id"))
+            else:
+                rival_id = rivalidade
+            if rival_id in (None, ""):
+                continue
+            rival_ids.append(str(rival_id))
+        return rival_ids
+
+    def _obter_pais_circuito(self, track_id: Any, track_name: str) -> str | None:
+        track_id_int = self._to_int(track_id, 0)
+        pais = self.PAIS_POR_TRACK_ID.get(track_id_int)
+        if pais:
+            return pais
+
+        nome = str(track_name or "").casefold()
+        if any(token in nome for token in ("summit", "daytona", "road america", "sebring", "indianapolis")):
+            return "eua"
+        if "brands hatch" in nome or "donington" in nome or "silverstone" in nome:
+            return "inglaterra"
+        if "spa" in nome:
+            return "belgica"
+        if "nurburgring" in nome or "hockenheim" in nome:
+            return "alemanha"
+        if "imola" in nome or "monza" in nome:
+            return "italia"
+        return None
+
+    def _calcular_max_pontos_por_corrida_categoria(self) -> int:
+        try:
+            from Logica.categorias import calcular_pontos_corrida
+
+            return int(
+                calcular_pontos_corrida(
+                    posicao=1,
+                    categoria_id=self.categoria_atual,
+                    eh_pole=True,
+                    volta_rapida=True,
+                    posicao_geral=1,
+                )
+            )
+        except Exception:
+            return 25
+
+    def _preparar_contexto_export_completo(self, pilotos_exportacao: list[dict]) -> dict:
+        from Logica.export import build_pilot_context, build_race_context
+
+        dados_corrida = self._resolver_dados_corrida_export()
+        rodada_atual = dados_corrida["rodada_atual"]
+        total_corridas = dados_corrida["total_corridas"]
+        track_id = dados_corrida["track_id"]
+        track_name = dados_corrida["track_name"]
+        clima_exibicao = dados_corrida["clima_exibicao"]
+        clima_m5 = dados_corrida["clima_m5"]
+
+        pilotos_categoria = obter_pilotos_categoria(self.banco, self.categoria_atual)
+        pilotos_ordenados = sorted(
+            pilotos_categoria,
+            key=lambda piloto: (
+                -int(piloto.get("pontos_temporada", 0) or 0),
+                -int(piloto.get("vitorias_temporada", 0) or 0),
+                -int(piloto.get("podios_temporada", 0) or 0),
+                -float(piloto.get("skill", 0) or 0),
+                str(piloto.get("nome", "")).casefold(),
+            ),
+        )
+
+        standings_by_id: dict[str, dict] = {}
+        points_by_id: dict[str, int] = {}
+        gaps_by_id: dict[str, int] = {}
+
+        pontos_lider = int(pilotos_ordenados[0].get("pontos_temporada", 0) or 0) if pilotos_ordenados else 0
+        rodadas_restantes = max(0, total_corridas - rodada_atual)
+        pontos_maximos_restantes = rodadas_restantes * self._calcular_max_pontos_por_corrida_categoria()
+
+        for posicao, piloto in enumerate(pilotos_ordenados, start=1):
+            piloto_id = str(piloto.get("id"))
+            pontos = int(piloto.get("pontos_temporada", 0) or 0)
+            gap = max(0, pontos_lider - pontos)
+            eliminado = gap > pontos_maximos_restantes
+            standings_by_id[piloto_id] = {
+                "position": posicao,
+                "points": pontos,
+                "gap_to_leader": gap,
+                "is_eliminated": eliminado,
+            }
+            points_by_id[piloto_id] = pontos
+            gaps_by_id[piloto_id] = gap
+
+        equipes_por_id = {
+            str(equipe.get("id")): equipe
+            for equipe in self.banco.get("equipes", [])
+            if isinstance(equipe, dict)
+        }
+
+        def _score_esperado(piloto: dict) -> float:
+            equipe = equipes_por_id.get(str(piloto.get("equipe_id")), {})
+            car_perf = float(equipe.get("car_performance", 50) or 50)
+            skill = float(piloto.get("skill", 50) or 50)
+            return (skill * 0.75) + (car_perf * 0.25)
+
+        pilotos_esperados = sorted(
+            pilotos_categoria,
+            key=lambda piloto: (
+                -_score_esperado(piloto),
+                -float(piloto.get("skill", 0) or 0),
+                str(piloto.get("nome", "")).casefold(),
+            ),
+        )
+        expected_position_by_id = {
+            str(piloto.get("id")): idx
+            for idx, piloto in enumerate(pilotos_esperados, start=1)
+        }
+
+        for piloto_id, info in standings_by_id.items():
+            esperado = expected_position_by_id.get(piloto_id, info["position"])
+            atual = max(1, info["position"])
+            ratio = float(esperado) / float(atual)
+            info["team_performance_vs_expectations"] = max(0.4, min(1.6, ratio))
+
+        ids_grid = {str(piloto.get("id")) for piloto in pilotos_categoria if piloto.get("id") is not None}
+        rivals_in_race_by_id: dict[str, list[str]] = {}
+        rivalries_map: dict[tuple[str, str], int] = {}
+
+        for piloto in pilotos_categoria:
+            piloto_id = str(piloto.get("id"))
+            rival_ids = self._resolver_ids_rivais(piloto)
+            rival_ids_grid = [rid for rid in rival_ids if rid in ids_grid]
+            rivals_in_race_by_id[piloto_id] = rival_ids_grid
+
+            rivalidades = piloto.get("rivalidades", [])
+            if not isinstance(rivalidades, list):
+                continue
+            for rivalidade in rivalidades:
+                if isinstance(rivalidade, dict):
+                    rival_id = rivalidade.get("rival_id", rivalidade.get("piloto_id"))
+                    intensidade = self._to_int(rivalidade.get("intensidade", 5), 5) * 10
+                else:
+                    rival_id = rivalidade
+                    intensidade = 50
+                if rival_id in (None, ""):
+                    continue
+                rival_id_str = str(rival_id)
+                if rival_id_str not in ids_grid or rival_id_str == piloto_id:
+                    continue
+                par = tuple(sorted((piloto_id, rival_id_str)))
+                rivalries_map[par] = max(rivalries_map.get(par, 0), max(0, min(100, intensidade)))
+
+        active_rivalries = [
+            (par[0], par[1], intensidade)
+            for par, intensidade in rivalries_map.items()
+        ]
+
+        pais_circuito = self._obter_pais_circuito(track_id, track_name)
+        home_race_pilots: list[str] = []
+        if pais_circuito:
+            for piloto in pilotos_categoria:
+                piloto_id = str(piloto.get("id"))
+                nacionalidade = str(piloto.get("nacionalidade", "")).casefold()
+                if pais_circuito in nacionalidade:
+                    home_race_pilots.append(piloto_id)
+
+        season_data = {
+            "standings_by_id": standings_by_id,
+            "expected_position_by_id": expected_position_by_id,
+            "rivals_in_race_by_id": rivals_in_race_by_id,
+            "home_race_pilots": home_race_pilots,
+        }
+
+        championship_payload = {
+            "standings": points_by_id,
+            "gaps": gaps_by_id,
+            "rivalries": active_rivalries,
+            "home_race_pilots": home_race_pilots,
+        }
+
+        race_ctx = build_race_context(
+            category_id=self.categoria_atual,
+            track_id=track_id,
+            track_name=track_name,
+            round_number=rodada_atual,
+            total_rounds=total_corridas,
+            championship_data=championship_payload,
+            weather_data=clima_m5,
+        )
+
+        pilot_ctx_by_id: dict[str, Any] = {}
+        races_this_season_by_id: dict[str, int] = {}
+        for piloto in pilotos_exportacao:
+            piloto_id = str(piloto.get("id"))
+            pilot_ctx_by_id[piloto_id] = build_pilot_context(
+                pilot=piloto,
+                season_data=season_data,
+                track_id=self._to_int(track_id, 0),
+            )
+            races_this_season_by_id[piloto_id] = self._to_int(piloto.get("corridas_temporada", 0), 0)
+
+        return {
+            "race_ctx": race_ctx,
+            "pilot_ctx_by_id": pilot_ctx_by_id,
+            "races_this_season_by_id": races_this_season_by_id,
+            "track_name": track_name,
+            "track_id": track_id,
+            "clima_exibicao": clima_exibicao,
+            "rodada_atual": rodada_atual,
+            "total_corridas": total_corridas,
+        }
+
+    def _salvar_relatorio_modificadores(
+        self,
+        pasta_season: str,
+        pilotos_export_data: list,
+        contexto_corrida: dict,
+    ) -> None:
+        if not pilotos_export_data:
+            return
+        try:
+            from Logica.export import generate_modifier_report_text
+
+            cabecalho = [
+                "=== MODIFICADORES DA CORRIDA ===",
+                (
+                    f"Circuito: {contexto_corrida.get('track_name', 'Desconhecido')} | "
+                    f"Clima: {contexto_corrida.get('clima_exibicao', 'Seco')} | "
+                    f"Rodada {contexto_corrida.get('rodada_atual', '?')}/"
+                    f"{contexto_corrida.get('total_corridas', '?')}"
+                ),
+                "",
+            ]
+            conteudo = generate_modifier_report_text(pilotos_export_data)
+            caminho_relatorio = os.path.join(pasta_season, "modifier_report.txt")
+            with open(caminho_relatorio, "w", encoding="utf-8") as arquivo_relatorio:
+                arquivo_relatorio.write("\n".join(cabecalho) + conteudo)
+        except Exception as erro:
+            print(f"Falha ao gerar modifier_report.txt: {erro}")
 
     def _limpar_toast_atual(self, toast_id=None, *_):
         toast_atual = getattr(self, "_toast_atual", None)
@@ -1057,6 +1385,7 @@ class ExportarImportarMixin:
             race_ctx = None
 
         drivers = []
+        pilotos_export_data = []
         for indice, piloto in enumerate(pilotos_multiclasse):
             categoria_id = piloto.get("categoria_atual", "mazda_rookie")
             carro_config = self.PRODUCTION_CAR_CARROS.get(
@@ -1070,11 +1399,23 @@ class ExportarImportarMixin:
                     carro_config,
                     cores_equipes,
                     race_ctx,
+                    races_this_season=self._to_int(piloto.get("corridas_temporada", 0), 0),
+                    pilotos_export_data=pilotos_export_data,
                 )
             )
 
         with open(arquivo, "w", encoding="utf-8") as arquivo_saida:
             json.dump({"drivers": drivers}, arquivo_saida, indent=4, ensure_ascii=True)
+        self._salvar_relatorio_modificadores(
+            pasta_season=pasta_season,
+            pilotos_export_data=pilotos_export_data,
+            contexto_corrida={
+                "track_name": "PCC Event",
+                "clima_exibicao": "Seco",
+                "rodada_atual": 1,
+                "total_corridas": 8,
+            },
+        )
 
         return arquivo, len(drivers)
 
@@ -1158,32 +1499,28 @@ class ExportarImportarMixin:
 
         # --- MODULE 5 INTEGRATION ---
         try:
-            from Logica.export import build_race_context
-            
-            # Obtém a rodada atual e infos do campeonato do banco
-            rodada_atual = self.banco.get("rodada_atual", 1)
-            calendario = self.banco.get("calendario", [])
-            total_corridas = len(calendario) if calendario else 10
-            
-            pista_atual = calendario[rodada_atual - 1] if calendario and 0 <= rodada_atual - 1 < len(calendario) else {}
-            
-            race_ctx = build_race_context(
-                category_id=self.categoria_atual,
-                track_id=pista_atual.get("id"),
-                track_name=pista_atual.get("nome", "Unknown Track"),
-                round_number=rodada_atual,
-                total_rounds=total_corridas,
-                championship_data=self.banco,
-                weather_data=pista_atual.get("clima")
-            )
+            contexto_export = self._preparar_contexto_export_completo(pilotos)
+            race_ctx = contexto_export.get("race_ctx")
+            pilot_ctx_by_id = contexto_export.get("pilot_ctx_by_id", {})
+            races_this_season_by_id = contexto_export.get("races_this_season_by_id", {})
         except Exception as e:
-            print(f"Erro ao criar race_context: {e}")
+            print(f"Erro ao preparar contexto de exportacao M5: {e}")
+            contexto_export = {
+                "track_name": "Unknown Track",
+                "clima_exibicao": "Seco",
+                "rodada_atual": self._to_int(self.banco.get("rodada_atual", 1), 1),
+                "total_corridas": len(self.banco.get("calendario", [])),
+            }
             race_ctx = None
+            pilot_ctx_by_id = {}
+            races_this_season_by_id = {}
         # ---------------------------
 
         drivers = []
+        pilotos_export_data = []
         for indice, piloto in enumerate(pilotos):
             carro_config = self._obter_config_carro_piloto(piloto, carros_equipes)
+            piloto_id = str(piloto.get("id"))
             drivers.append(
                 self._criar_driver_iracing(
                     piloto,
@@ -1191,12 +1528,20 @@ class ExportarImportarMixin:
                     carro_config,
                     cores_equipes,
                     race_ctx,
+                    pilot_ctx=pilot_ctx_by_id.get(piloto_id),
+                    races_this_season=races_this_season_by_id.get(piloto_id),
+                    pilotos_export_data=pilotos_export_data,
                 )
             )
 
         try:
             with open(arquivo, "w", encoding="utf-8") as arquivo_saida:
                 json.dump({"drivers": drivers}, arquivo_saida, indent=4, ensure_ascii=True)
+            self._salvar_relatorio_modificadores(
+                pasta_season=pasta_season,
+                pilotos_export_data=pilotos_export_data,
+                contexto_corrida=contexto_export,
+            )
         except OSError as erro:
             QMessageBox.critical(
                 self,
@@ -1257,50 +1602,57 @@ class ExportarImportarMixin:
         carro_config: dict,
         cores_equipes: dict[str, str],
         race_ctx=None,
+        pilot_ctx=None,
+        races_this_season: int | None = None,
+        pilotos_export_data: list | None = None,
     ) -> dict:
         nome_completo = str(piloto.get("nome", ""))
-        partes_nome = nome_completo.split(" ", 1)
-        primeiro_nome = partes_nome[0]
-        sobrenome = partes_nome[1] if len(partes_nome) > 1 else ""
-
         idade = int(piloto.get("idade", 25))
 
         # --- MODULE 5 INTEGRATION ---
         try:
-            from Logica.export import calculate_pilot_for_export, build_pilot_context
-            
-            pilot_ctx = build_pilot_context(piloto)
-            
-            export_data = calculate_pilot_for_export(
+            from Logica.export import build_pilot_context, export_pilot_data
+
+            if pilot_ctx is None:
+                pilot_ctx = build_pilot_context(piloto)
+            if races_this_season is None:
+                races_this_season = self._to_int(piloto.get("corridas_temporada", 0), 0)
+
+            export_data = export_pilot_data(
                 pilot=piloto,
                 pilot_ctx=pilot_ctx,
                 race_ctx=race_ctx,
-                races_this_season=self.banco.get("rodada_atual", 1) - 1,
+                car_number=str(piloto.get("numero", indice + 1)),
+                livery={},
+                races_this_season=self._to_int(races_this_season, 0),
             )
-            
-            skill = export_data.get("skill", 0)
-            aggression = export_data.get("aggression", 0)
-            optimism = export_data.get("optimism", 0)
-            smoothness = export_data.get("smoothness", 0)
-            
+
+            skill = int(export_data.skill)
+            aggression = int(export_data.aggression)
+            optimism = int(export_data.optimism)
+            smoothness = int(export_data.smoothness)
+
+            if isinstance(pilotos_export_data, list):
+                pilotos_export_data.append(export_data)
+
             pit_crew = int(piloto.get("pit_crew", 50))
             strategy = int(piloto.get("strategy_risk", 50))
-            
+
         except Exception as e:
             print(f"Fallback esport_data: {e}")
-            skill = converter_para_intervalo(piloto.get("skill", 0))
-            aggression = converter_para_intervalo(piloto.get("agressividade", 0))
-            optimism = converter_para_intervalo(piloto.get("otimismo", 0))
-            smoothness = converter_para_intervalo(piloto.get("suavidade", 0))
+            skill = self._normalizar_valor_iracing(piloto.get("skill", 50), 50)
+            aggression = self._normalizar_valor_iracing(piloto.get("aggression", 50), 50)
+            optimism = self._normalizar_valor_iracing(piloto.get("optimism", 50), 50)
+            smoothness = self._normalizar_valor_iracing(piloto.get("smoothness", 50), 50)
             pit_crew = int(piloto.get("pit_crew", 50))
             strategy = int(piloto.get("strategy_risk", 50))
         # ---------------------------
 
         equipe_id = str(piloto.get("equipe_id", ""))
         cor_hex = cores_equipes.get(equipe_id, "FFFFFF")
-        cor_iracing = f"{cor_hex},FFFFFF,FFFFFF"
-
-        seed_base = f"{nome_completo}_{idade}_{piloto.get('pais', '')}"
+        seed_base = f"{nome_completo}_{idade}_{piloto.get('nacionalidade', '')}"
+        cust_id = str(uuid.uuid5(uuid.NAMESPACE_DNS, seed_base))
+        pilot_id = str(piloto.get("id", ""))
 
         return {
             "driverName": nome_completo,
@@ -1319,7 +1671,9 @@ class ExportarImportarMixin:
             "pitCrewSkill": pit_crew,
             "strategyRiskiness": strategy,
             "driverAge": idade,
-            "id": str(uuid.uuid5(uuid.NAMESPACE_DNS, seed_base)),
+            "id": cust_id,
+            "custId": cust_id,
+            "pilot_id": pilot_id,
             "rowIndex": indice,
         }
     def _validar_calendario_para_exportacao(self) -> tuple[bool, str]:
@@ -1737,7 +2091,16 @@ class ExportarImportarMixin:
             )
             return
 
-        aplicados = self._aplicar_classificacao_por_nome(classificacao)
+        try:
+            rodada_resultado = int(resultado.get("rodada", self.banco.get("rodada_atual", 1)))
+        except (TypeError, ValueError):
+            rodada_resultado = int(self.banco.get("rodada_atual", 1) or 1)
+
+        aplicados = self._aplicar_classificacao_por_nome(
+            classificacao,
+            rodada=rodada_resultado,
+            foi_corrida_jogador=True,
+        )
         if aplicados <= 0:
             QMessageBox.warning(
                 self,
@@ -1748,10 +2111,13 @@ class ExportarImportarMixin:
             return
 
         calcular_pontos_equipes(self.banco, self.categoria_atual)
+        simular_paralelo = getattr(self, "_simular_rodada_todas_categorias", None)
+        if callable(simular_paralelo):
+            simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
         self._avancar_rodada()
         self._atualizar_tudo()
 
-        rodada = int(resultado.get("rodada", self.banco.get("rodada_atual", 1)))
+        rodada = rodada_resultado
         vencedor = str(resultado.get("vencedor", "")).strip() or "Nao identificado"
         total_resultados = len(classificacao)
         nao_aplicados = max(0, total_resultados - aplicados)
@@ -1794,7 +2160,11 @@ class ExportarImportarMixin:
                     "volta_rapida": bool(nome and nome == melhor_nome),
                 }
             )
-        aplicados = self._aplicar_classificacao_por_nome(classificacao)
+        aplicados = self._aplicar_classificacao_por_nome(
+            classificacao,
+            rodada=int(self.banco.get("rodada_atual", 1) or 1),
+            foi_corrida_jogador=True,
+        )
         calcular_pontos_equipes(self.banco, self.categoria_atual)
         return aplicados
 
@@ -1894,6 +2264,9 @@ class ExportarImportarMixin:
             return
 
         if not evento_pcc:
+            simular_paralelo = getattr(self, "_simular_rodada_todas_categorias", None)
+            if callable(simular_paralelo):
+                simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
             self._avancar_rodada()
         else:
             salvar_banco(self.banco)

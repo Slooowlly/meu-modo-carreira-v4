@@ -36,6 +36,15 @@ def _get(piloto: Any, campo: str, default=None):
     return getattr(piloto, campo, default)
 
 
+def _papel_normalizado(piloto: Any) -> str:
+    papel = str(_get(piloto, "papel", "") or "").strip().lower()
+    if papel in {"n1", "numero_1"}:
+        return "numero_1"
+    if papel in {"n2", "numero_2"}:
+        return "numero_2"
+    return papel
+
+
 @dataclass
 class CalculoVisibilidade:
     """Detalhes do calculo de visibilidade."""
@@ -132,6 +141,10 @@ def calcular_visibilidade(
     if is_advanced_subtier:
         calc.bonus_outros += VISIBILIDADE_CONFIG["sub_tier_advanced"]
 
+    # M9: piloto N2 perde exposicao no mercado.
+    if _papel_normalizado(piloto) == "numero_2":
+        calc.penalidades -= 2.0
+
     calc.calcular_total()
     return calc
 
@@ -173,4 +186,3 @@ def filtrar_pilotos_visiveis(pilotos: list[Any], categoria_destino_tier: int) ->
 def categoria_permite_mercado_externo(categoria_id: str) -> bool:
     """Verifica se categoria permite visibilidade externa."""
     return str(categoria_id or "").strip().lower() not in CATEGORIAS_INVISIVEIS
-

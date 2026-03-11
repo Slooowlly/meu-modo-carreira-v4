@@ -42,6 +42,25 @@ def _contrato_define_numero_1(contrato: Any) -> bool:
     return False
 
 
+def _anos_contrato(contrato: Any) -> int:
+    if contrato is None:
+        return 0
+    bruto = _get_any(
+        contrato,
+        (
+            "duracao_anos",
+            "anos_restantes",
+            "contrato_anos",
+            "anos",
+        ),
+        0,
+    )
+    try:
+        return max(0, int(bruto or 0))
+    except (TypeError, ValueError):
+        return 0
+
+
 def comparar_resultado_corrida(
     piloto_1: Any,
     piloto_2: Any,
@@ -130,40 +149,38 @@ def definir_hierarquia_inicial(
     Define hierarquia inicial entre dois pilotos.
 
     Prioridade:
-    1) Contrato
-    2) Salario
-    3) Skill
-    4) Experiencia
-    5) Idade (desempate)
+    1) Contrato (duracao)
+    2) Skill
+    3) Experiencia
+    4) Idade (desempate)
     """
     p1_id = _extrair_id(piloto_1)
     p2_id = _extrair_id(piloto_2)
 
+    anos_1 = _anos_contrato(contrato_1)
+    anos_2 = _anos_contrato(contrato_2)
+    if anos_1 > anos_2:
+        return p1_id, p2_id, MotivoHierarquia.CONTRATO
+    if anos_2 > anos_1:
+        return p2_id, p1_id, MotivoHierarquia.CONTRATO
+
     if contrato_1 and _contrato_define_numero_1(contrato_1):
         return p1_id, p2_id, MotivoHierarquia.CONTRATO
-
     if contrato_2 and _contrato_define_numero_1(contrato_2):
         return p2_id, p1_id, MotivoHierarquia.CONTRATO
 
-    salario_1 = float(_get_any(contrato_1, ("salario_anual", "salario"), 0.0) or 0.0) if contrato_1 else 0.0
-    salario_2 = float(_get_any(contrato_2, ("salario_anual", "salario"), 0.0) or 0.0) if contrato_2 else 0.0
-    if salario_1 > salario_2 * 1.2:
-        return p1_id, p2_id, MotivoHierarquia.SALARIO
-    if salario_2 > salario_1 * 1.2:
-        return p2_id, p1_id, MotivoHierarquia.SALARIO
-
     skill_1 = float(_get(piloto_1, "skill", 50) or 50)
     skill_2 = float(_get(piloto_2, "skill", 50) or 50)
-    if skill_1 > skill_2 + 3:
+    if skill_1 > skill_2:
         return p1_id, p2_id, MotivoHierarquia.SKILL
-    if skill_2 > skill_1 + 3:
+    if skill_2 > skill_1:
         return p2_id, p1_id, MotivoHierarquia.SKILL
 
     exp_1 = float(_get_any(piloto_1, ("experience", "experiencia"), 0) or 0)
     exp_2 = float(_get_any(piloto_2, ("experience", "experiencia"), 0) or 0)
-    if exp_1 > exp_2 + 10:
+    if exp_1 > exp_2:
         return p1_id, p2_id, MotivoHierarquia.EXPERIENCIA
-    if exp_2 > exp_1 + 10:
+    if exp_2 > exp_1:
         return p2_id, p1_id, MotivoHierarquia.EXPERIENCIA
 
     idade_1 = int(_get_any(piloto_1, ("idade", "age"), 25) or 25)

@@ -1,18 +1,17 @@
 # Logica/export/skill_modifiers.py
 """
-Modificadores que afetam o SKILL (velocidade) do piloto.
+Skill modifiers used by Module 5 export.
 
-O skill afeta diretamente a velocidade do carro no iRacing.
-Modificadores são aplicados como PORCENTAGEM do skill base.
+All values here are percentage deltas applied over base skill.
 """
+
+from __future__ import annotations
 
 from .models import Modifier, ModifierSource, PilotContext, RaceContext
 
 
 def calculate_category_familiarity(pilot_ctx: PilotContext) -> Modifier:
-    """
-    Penalidade por inexperiência na categoria.
-    """
+    """Penalty for low experience in current category."""
     races = pilot_ctx.races_in_category
 
     if races < 3:
@@ -20,7 +19,7 @@ def calculate_category_familiarity(pilot_ctx: PilotContext) -> Modifier:
         desc = f"Novato na categoria ({races} corridas)"
     elif races < 6:
         value = -5.0
-        desc = f"Pouca experiência ({races} corridas)"
+        desc = f"Pouca experiencia ({races} corridas)"
     elif races < 10:
         value = -2.0
         desc = f"Adaptando-se ({races} corridas)"
@@ -31,14 +30,12 @@ def calculate_category_familiarity(pilot_ctx: PilotContext) -> Modifier:
     return Modifier(
         source=ModifierSource.CATEGORY_FAMILIARITY,
         value=value,
-        description=desc
+        description=desc,
     )
 
 
 def calculate_track_knowledge(pilot_ctx: PilotContext) -> Modifier:
-    """
-    Bônus/penalidade por conhecimento do circuito.
-    """
+    """Bonus or penalty from circuit history."""
     times = pilot_ctx.times_at_track
     best = pilot_ctx.best_result_at_track
 
@@ -47,7 +44,7 @@ def calculate_track_knowledge(pilot_ctx: PilotContext) -> Modifier:
         desc = "Primeira vez nesta pista"
     elif times == 1:
         value = -3.0
-        desc = "Pouca experiência na pista"
+        desc = "Pouca experiencia na pista"
     elif times <= 3:
         value = 0.0
         desc = "Conhece a pista"
@@ -60,53 +57,51 @@ def calculate_track_knowledge(pilot_ctx: PilotContext) -> Modifier:
 
     if best <= 3 and times > 0:
         value += 2.0
-        desc += f" + histórico forte (P{best})"
+        desc += f" + historico forte (P{best})"
 
     return Modifier(
         source=ModifierSource.TRACK_KNOWLEDGE,
         value=value,
-        description=desc
+        description=desc,
     )
 
 
 def calculate_injury_modifier(pilot_ctx: PilotContext) -> Modifier:
     """
-    Penalidade por lesão ativa.
+    Injury modifier.
+
+    M4 is the source of truth:
+    - modifier -0.05 -> -5.0
+    - modifier -0.15 -> -15.0
+    - modifier -0.30 -> -30.0
     """
     if not pilot_ctx.has_injury:
         return Modifier(
             source=ModifierSource.INJURY,
             value=0.0,
-            description="Sem lesão"
+            description="Sem lesao",
         )
 
-    severity = pilot_ctx.injury_severity
-
-    if severity < 0.3:
-        value = -5.0
-        desc = f"Lesão leve ({pilot_ctx.injury_races_left} corridas restantes)"
-    elif severity < 0.6:
-        value = -10.0
-        desc = f"Lesão moderada ({pilot_ctx.injury_races_left} corridas restantes)"
-    else:
-        value = -15.0
-        desc = f"Lesão grave ({pilot_ctx.injury_races_left} corridas restantes)"
+    severity = max(0.0, min(1.0, float(pilot_ctx.injury_severity or 0.0)))
+    value = -(severity * 100.0)
+    desc = (
+        f"Lesao ativa ({value:.1f}% no skill, "
+        f"{pilot_ctx.injury_races_left} corridas restantes)"
+    )
 
     return Modifier(
         source=ModifierSource.INJURY,
         value=value,
-        description=desc
+        description=desc,
     )
 
 
 def calculate_pressure_clutch(
     pilot_ctx: PilotContext,
     race_ctx: RaceContext,
-    clutch_factor: float
+    fator_clutch: float,
 ) -> Modifier:
-    """
-    Modificador de pressão × clutch factor.
-    """
+    """Pressure x clutch interaction."""
     pressure = 0.0
     pressure_reasons = []
 
@@ -117,7 +112,7 @@ def calculate_pressure_clutch(
     rounds_left = race_ctx.total_rounds - race_ctx.round_number
     if rounds_left <= 3 and pilot_ctx.championship_position <= 3:
         pressure += 30.0
-        pressure_reasons.append("briga pelo título")
+        pressure_reasons.append("briga pelo titulo")
 
     if pilot_ctx.points_to_leader <= 20 and pilot_ctx.championship_position <= 5:
         pressure += 20.0
@@ -127,37 +122,32 @@ def calculate_pressure_clutch(
         return Modifier(
             source=ModifierSource.PRESSURE_CLUTCH,
             value=0.0,
-            description="Sem pressão significativa"
+            description="Sem pressao significativa",
         )
 
-    # Clutch effect: -1 a +1
-    clutch_effect = (clutch_factor - 50) / 50
-
-    # Pressão máxima = ±10%
+    clutch_effect = (fator_clutch - 50) / 50
     max_effect = 10.0
     value = (pressure / 100) * max_effect * clutch_effect
 
     if value >= 0:
-        desc = f"Brilha sob pressão ({', '.join(pressure_reasons)})"
+        desc = f"Brilha sob pressao ({', '.join(pressure_reasons)})"
     else:
-        desc = f"Afetado pela pressão ({', '.join(pressure_reasons)})"
+        desc = f"Afetado pela pressao ({', '.join(pressure_reasons)})"
 
     return Modifier(
         source=ModifierSource.PRESSURE_CLUTCH,
         value=value,
-        description=desc
+        description=desc,
     )
 
 
 def calculate_momentum(pilot_ctx: PilotContext) -> Modifier:
-    """
-    Modificador de momentum baseado nos últimos 5 resultados.
-    """
+    """Momentum from last 5 races versus expected."""
     if not pilot_ctx.last_5_results or not pilot_ctx.last_5_expected:
         return Modifier(
             source=ModifierSource.MOMENTUM,
             value=0.0,
-            description="Sem histórico suficiente"
+            description="Sem historico suficiente",
         )
 
     above = 0
@@ -188,22 +178,20 @@ def calculate_momentum(pilot_ctx: PilotContext) -> Modifier:
     return Modifier(
         source=ModifierSource.MOMENTUM,
         value=value,
-        description=desc
+        description=desc,
     )
 
 
 def calculate_rain_skill_modifier(
     race_ctx: RaceContext,
-    rain_factor: float
+    fator_chuva: float,
 ) -> Modifier:
-    """
-    Penalidade de chuva no skill.
-    """
+    """Rain penalty in skill."""
     if not race_ctx.is_wet:
         return Modifier(
             source=ModifierSource.RAIN,
             value=0.0,
-            description="Pista seca"
+            description="Pista seca",
         )
 
     base_penalty = 12.0
@@ -218,28 +206,28 @@ def calculate_rain_skill_modifier(
         intensity_mult = 1.5
         rain_desc = "Chuva forte"
 
-    absorption = (rain_factor / 100) * 0.90
+    absorption = (fator_chuva / 100) * 0.90
     penalty = base_penalty * intensity_mult * (1 - absorption)
 
     return Modifier(
         source=ModifierSource.RAIN,
         value=-penalty,
-        description=f"{rain_desc} (rain skill: {rain_factor:.0f})"
+        description=f"{rain_desc} (fator chuva: {fator_chuva:.0f})",
     )
 
 
 def get_all_skill_modifiers(
     pilot_ctx: PilotContext,
     race_ctx: RaceContext,
-    clutch_factor: float,
-    rain_factor: float
+    fator_clutch: float,
+    fator_chuva: float,
 ) -> list[Modifier]:
-    """Retorna todos os modificadores de skill"""
+    """Return all skill modifiers."""
     return [
         calculate_category_familiarity(pilot_ctx),
         calculate_track_knowledge(pilot_ctx),
         calculate_injury_modifier(pilot_ctx),
-        calculate_pressure_clutch(pilot_ctx, race_ctx, clutch_factor),
+        calculate_pressure_clutch(pilot_ctx, race_ctx, fator_clutch),
         calculate_momentum(pilot_ctx),
-        calculate_rain_skill_modifier(race_ctx, rain_factor)
+        calculate_rain_skill_modifier(race_ctx, fator_chuva),
     ]

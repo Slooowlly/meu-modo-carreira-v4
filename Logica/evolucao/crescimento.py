@@ -259,7 +259,11 @@ def processar_crescimento(pilot, ctx: ContextoTemporada) -> list[EvolucaoAtribut
 
     potencial = _get_valor(pilot, "potencial", _get_valor(pilot, "potencial_base", 85.0))
     idade = int(_get_valor(pilot, "idade", 25.0))
-    motivacao = _get_valor(pilot, "motivacao", 50.0)
+    motivacao_media_ctx = getattr(ctx, "motivacao_media_temporada", None)
+    if isinstance(motivacao_media_ctx, (int, float)):
+        motivacao = float(motivacao_media_ctx)
+    else:
+        motivacao = _get_valor(pilot, "motivacao", 50.0)
 
     for atributo in ATRIBUTOS_EVOLUIVEIS:
         valor_atual = _get_valor(pilot, atributo, 50.0)
@@ -282,4 +286,3 @@ def aplicar_crescimento(pilot, evolucoes: list[EvolucaoAtributo]):
     """
     for evo in evolucoes:
         _set_valor(pilot, evo.atributo, evo.valor_novo)
-

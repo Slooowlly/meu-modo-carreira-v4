@@ -43,6 +43,40 @@ class ConfigMixin:
             f"Pasta configurada:\n{pasta}",
         )
 
+    def _configurar_conteudo_iracing(self) -> None:
+        try:
+            from UI.dialogs import DialogConteudoIRacing
+        except ImportError:
+            QMessageBox.warning(
+                self,
+                "Aviso",
+                "Dialogo de conteudo iRacing indisponivel.",
+            )
+            return
+
+        try:
+            dialogo = DialogConteudoIRacing(self.banco.get("conteudo_iracing", {}), self)
+            if dialogo.exec() != dialogo.Accepted:
+                return
+
+            self.banco["conteudo_iracing"] = dialogo.resultado()
+            salvar_banco(self.banco)
+
+            if hasattr(self, "_atualizar_tudo"):
+                self._atualizar_tudo()
+
+            QMessageBox.information(
+                self,
+                "Conteudo iRacing",
+                "Conteudo atualizado com sucesso.",
+            )
+        except Exception as erro:
+            QMessageBox.critical(
+                self,
+                "Erro",
+                f"Erro ao configurar conteudo iRacing:\n{erro}",
+            )
+
     def _abrir_historia(self) -> None:
         try:
             from UI.historia import TelaHistoria

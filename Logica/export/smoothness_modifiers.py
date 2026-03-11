@@ -1,65 +1,59 @@
 # Logica/export/smoothness_modifiers.py
 """
-Modificadores que afetam a SUAVIDADE do piloto.
-
-A suavidade afeta:
-- Fluidez nas curvas
-- Consistência nas trajetórias
-- Controle do carro em situações limite
+Smoothness modifiers used by Module 5 export.
 """
+
+from __future__ import annotations
 
 from .models import Modifier, ModifierSource, PilotContext, RaceContext
 
 
-def calculate_experience_modifier(experience: float) -> Modifier:
-    """
-    Modificador baseado em experiência geral.
-    """
-    if experience >= 80:
+def calculate_experience_modifier(experiencia: float) -> Modifier:
+    """Global experience impact."""
+    if experiencia >= 80:
         return Modifier(
             source=ModifierSource.EXPERIENCE,
             value=6.0,
-            description=f"Muito experiente ({experience:.0f})"
+            description=f"Muito experiente ({experiencia:.0f})",
         )
-    elif experience >= 50:
+    if experiencia >= 50:
         return Modifier(
             source=ModifierSource.EXPERIENCE,
             value=2.0,
-            description=f"Experiência razoável ({experience:.0f})"
+            description=f"Experiencia razoavel ({experiencia:.0f})",
         )
-    elif experience >= 30:
+    if experiencia >= 30:
         return Modifier(
             source=ModifierSource.EXPERIENCE,
             value=0.0,
-            description=f"Experiência normal ({experience:.0f})"
+            description=f"Experiencia normal ({experiencia:.0f})",
         )
-    elif experience >= 15:
+    if experiencia >= 15:
         return Modifier(
             source=ModifierSource.EXPERIENCE,
             value=-6.0,
-            description=f"Pouca experiência ({experience:.0f})"
+            description=f"Pouca experiencia ({experiencia:.0f})",
         )
-    else:
-        return Modifier(
-            source=ModifierSource.EXPERIENCE,
-            value=-10.0,
-            description=f"Muito inexperiente ({experience:.0f})"
-        )
+
+    return Modifier(
+        source=ModifierSource.EXPERIENCE,
+        value=-10.0,
+        description=f"Muito inexperiente ({experiencia:.0f})",
+    )
 
 
 def calculate_frustration_smoothness(pilot_ctx: PilotContext) -> Modifier:
-    """
-    Redução de suavidade por frustração.
-    """
+    """Smoothness loss when driver is frustrated."""
     if not pilot_ctx.last_5_results or not pilot_ctx.last_5_expected:
         return Modifier(
             source=ModifierSource.FRUSTRATION,
             value=0.0,
-            description="Sem histórico"
+            description="Sem historico",
         )
 
     below = 0
-    for result, expected in zip(pilot_ctx.last_5_results[:3], pilot_ctx.last_5_expected[:3]):
+    # Usa os 3 resultados mais recentes.
+    for result, expected in zip(pilot_ctx.last_5_results[-3:], pilot_ctx.last_5_expected[-3:]):
         if result > expected + 4:
             below += 1
 
@@ -67,35 +61,33 @@ def calculate_frustration_smoothness(pilot_ctx: PilotContext) -> Modifier:
         return Modifier(
             source=ModifierSource.FRUSTRATION,
             value=-6.0,
-            description="Frustrado - menos suave"
+            description="Frustrado - menos suave",
         )
-    elif below >= 2:
+    if below >= 2:
         return Modifier(
             source=ModifierSource.FRUSTRATION,
             value=-3.0,
-            description="Um pouco frustrado"
+            description="Um pouco frustrado",
         )
 
     return Modifier(
         source=ModifierSource.FRUSTRATION,
         value=0.0,
-        description="Sem frustração"
+        description="Sem frustracao",
     )
 
 
 def calculate_fatigue_modifier(
     race_ctx: RaceContext,
-    races_this_season: int
+    races_this_season: int,
 ) -> Modifier:
-    """
-    Redução de suavidade por fadiga do calendário.
-    """
+    """Calendar fatigue impact."""
     value = 0.0
     reasons = []
 
     if races_this_season > 20:
         value -= 6.0
-        reasons.append(f"calendário intenso ({races_this_season} corridas)")
+        reasons.append(f"calendario intenso ({races_this_season} corridas)")
     elif races_this_season > 15:
         value -= 4.0
         reasons.append(f"muitas corridas ({races_this_season})")
@@ -109,25 +101,23 @@ def calculate_fatigue_modifier(
         return Modifier(
             source=ModifierSource.FATIGUE,
             value=0.0,
-            description="Sem fadiga"
+            description="Sem fadiga",
         )
 
     return Modifier(
         source=ModifierSource.FATIGUE,
         value=value,
-        description=", ".join(reasons)
+        description=", ".join(reasons),
     )
 
 
 def calculate_confidence_modifier(pilot_ctx: PilotContext) -> Modifier:
-    """
-    Modificador de confiança na categoria.
-    """
+    """Confidence in category from recent form."""
     if not pilot_ctx.last_5_results:
         return Modifier(
             source=ModifierSource.CONFIDENCE,
             value=0.0,
-            description="Sem histórico"
+            description="Sem historico",
         )
 
     avg_position = sum(pilot_ctx.last_5_results) / len(pilot_ctx.last_5_results)
@@ -136,52 +126,50 @@ def calculate_confidence_modifier(pilot_ctx: PilotContext) -> Modifier:
         return Modifier(
             source=ModifierSource.CONFIDENCE,
             value=5.0,
-            description="Dominando a categoria"
+            description="Dominando a categoria",
         )
-    elif avg_position <= 10:
+    if avg_position <= 10:
         return Modifier(
             source=ModifierSource.CONFIDENCE,
             value=2.0,
-            description="Confiante"
+            description="Confiante",
         )
-    elif avg_position > 15:
+    if avg_position > 15:
         return Modifier(
             source=ModifierSource.CONFIDENCE,
             value=-5.0,
-            description="Falta de confiança"
+            description="Falta de confianca",
         )
 
     return Modifier(
         source=ModifierSource.CONFIDENCE,
         value=0.0,
-        description="Confiança normal"
+        description="Confianca normal",
     )
 
 
 def calculate_rain_insecurity(
     race_ctx: RaceContext,
-    rain_factor: float
+    fator_chuva: float,
 ) -> Modifier:
-    """
-    Redução de suavidade na chuva para pilotos inseguros.
-    """
+    """Smoothness loss in wet for low rain skill."""
     if not race_ctx.is_wet:
         return Modifier(
             source=ModifierSource.RAIN_INSECURITY,
             value=0.0,
-            description="Pista seca"
+            description="Pista seca",
         )
 
-    if rain_factor < 30:
+    if fator_chuva < 30:
         value = -12.0
         desc = "Muito inseguro na chuva"
-    elif rain_factor < 40:
+    elif fator_chuva < 40:
         value = -10.0
         desc = "Inseguro na chuva"
-    elif rain_factor < 60:
+    elif fator_chuva < 60:
         value = -5.0
-        desc = "Desconfortável na chuva"
-    elif rain_factor < 80:
+        desc = "Desconfortavel na chuva"
+    elif fator_chuva < 80:
         value = -2.0
         desc = "OK na chuva"
     else:
@@ -191,22 +179,22 @@ def calculate_rain_insecurity(
     return Modifier(
         source=ModifierSource.RAIN_INSECURITY,
         value=value,
-        description=desc
+        description=desc,
     )
 
 
 def get_all_smoothness_modifiers(
     pilot_ctx: PilotContext,
     race_ctx: RaceContext,
-    experience: float,
-    rain_factor: float,
-    races_this_season: int
+    experiencia: float,
+    fator_chuva: float,
+    races_this_season: int,
 ) -> list[Modifier]:
-    """Retorna todos os modificadores de suavidade"""
+    """Return all smoothness modifiers."""
     return [
-        calculate_experience_modifier(experience),
+        calculate_experience_modifier(experiencia),
         calculate_frustration_smoothness(pilot_ctx),
         calculate_fatigue_modifier(race_ctx, races_this_season),
         calculate_confidence_modifier(pilot_ctx),
-        calculate_rain_insecurity(race_ctx, rain_factor)
+        calculate_rain_insecurity(race_ctx, fator_chuva),
     ]
