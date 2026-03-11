@@ -1,4 +1,4 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 import json
 import os
@@ -808,8 +808,108 @@ class ExportarImportarMixin:
             caminho_relatorio = os.path.join(pasta_season, "modifier_report.txt")
             with open(caminho_relatorio, "w", encoding="utf-8") as arquivo_relatorio:
                 arquivo_relatorio.write("\n".join(cabecalho) + conteudo)
+            self._persistir_preview_modificadores(
+                pilotos_export_data=pilotos_export_data,
+                contexto_corrida=contexto_corrida,
+            )
         except Exception as erro:
             print(f"Falha ao gerar modifier_report.txt: {erro}")
+
+    @staticmethod
+    def _clamp_export_modifier(valor: float, limite: float) -> float:
+        return max(-float(limite), min(float(limite), float(valor)))
+
+    def _persistir_preview_modificadores(
+        self,
+        *,
+        pilotos_export_data: list,
+        contexto_corrida: dict,
+    ) -> None:
+        """Persistencia estruturada dos modificadores para exibicao no dialogo da UI."""
+        pilotos_por_id = {
+            str(p.get("id")): p for p in self.banco.get("pilotos", []) if isinstance(p, dict)
+        }
+        linhas: list[dict[str, Any]] = []
+        for item in pilotos_export_data:
+            relatorio = getattr(item, "modifier_report", None)
+            piloto_id = str(getattr(item, "pilot_id", "") or "")
+            piloto_ref = pilotos_por_id.get(piloto_id, {})
+            nome = str(
+                getattr(item, "display_name", piloto_ref.get("nome", "Piloto")) or "Piloto"
+            )
+            equipe_nome = str(piloto_ref.get("equipe_nome", "Equipe") or "Equipe")
+
+            skill_base = float(getattr(item, "original_skill", 0.0) or 0.0)
+            skill_final = int(getattr(item, "skill", round(skill_base)) or round(skill_base))
+
+            agg_final = int(getattr(item, "aggression", 50) or 50)
+            opt_final = int(getattr(item, "optimism", 50) or 50)
+            smo_final = int(getattr(item, "smoothness", 50) or 50)
+
+            agg_total = float(getattr(relatorio, "aggression_total", 0.0) or 0.0) if relatorio else 0.0
+            opt_total = float(getattr(relatorio, "optimism_total", 0.0) or 0.0) if relatorio else 0.0
+            smo_total = float(getattr(relatorio, "smoothness_total", 0.0) or 0.0) if relatorio else 0.0
+
+            agg_base = int(round(agg_final - self._clamp_export_modifier(agg_total, 25.0)))
+            opt_base = int(round(opt_final - self._clamp_export_modifier(opt_total, 20.0)))
+            smo_base = int(round(smo_final - self._clamp_export_modifier(smo_total, 20.0)))
+
+            def _serializar_mods(lista_mods) -> list[dict[str, Any]]:
+                saida: list[dict[str, Any]] = []
+                for mod in (lista_mods or []):
+                    valor = float(getattr(mod, "value", 0.0) or 0.0)
+                    saida.append(
+                        {
+                            "fonte": str(getattr(getattr(mod, "source", None), "value", "") or ""),
+                            "valor": valor,
+                            "descricao": str(getattr(mod, "description", "") or ""),
+                        }
+                    )
+                return saida
+
+            skill_mods = _serializar_mods(getattr(relatorio, "skill_modifiers", []) if relatorio else [])
+            agg_mods = _serializar_mods(getattr(relatorio, "aggression_modifiers", []) if relatorio else [])
+            opt_mods = _serializar_mods(getattr(relatorio, "optimism_modifiers", []) if relatorio else [])
+            smo_mods = _serializar_mods(getattr(relatorio, "smoothness_modifiers", []) if relatorio else [])
+            ativo = any(abs(float(mod.get("valor", 0.0) or 0.0)) > 0.01 for mod in (skill_mods + agg_mods + opt_mods + smo_mods))
+
+            linhas.append(
+                {
+                    "piloto_id": piloto_id,
+                    "nome": nome,
+                    "equipe_nome": equipe_nome,
+                    "skill_base": int(round(skill_base)),
+                    "skill_final": int(skill_final),
+                    "aggression_base": int(agg_base),
+                    "aggression_final": int(agg_final),
+                    "optimism_base": int(opt_base),
+                    "optimism_final": int(opt_final),
+                    "smoothness_base": int(smo_base),
+                    "smoothness_final": int(smo_final),
+                    "skill_modifiers": skill_mods,
+                    "aggression_modifiers": agg_mods,
+                    "optimism_modifiers": opt_mods,
+                    "smoothness_modifiers": smo_mods,
+                    "ativo": bool(ativo),
+                }
+            )
+
+        linhas.sort(
+            key=lambda item: (
+                not bool(item.get("ativo", False)),
+                -int(item.get("skill_final", 0) or 0),
+                str(item.get("nome", "")).casefold(),
+            )
+        )
+
+        self.banco["modifier_preview"] = {
+            "categoria_id": str(getattr(self, "categoria_atual", "") or ""),
+            "track_name": str(contexto_corrida.get("track_name", "Pista desconhecida") or "Pista desconhecida"),
+            "clima": str(contexto_corrida.get("clima_exibicao", "Seco") or "Seco"),
+            "rodada_atual": int(contexto_corrida.get("rodada_atual", self.banco.get("rodada_atual", 1)) or 1),
+            "total_corridas": int(contexto_corrida.get("total_corridas", len(self.banco.get("calendario", []))) or len(self.banco.get("calendario", []))),
+            "pilotos": linhas,
+        }
 
     def _limpar_toast_atual(self, toast_id=None, *_):
         toast_atual = getattr(self, "_toast_atual", None)
@@ -1109,12 +1209,18 @@ class ExportarImportarMixin:
             reiniciar_monitor()
 
     def _obter_arquivo_season_salvo(self) -> str:
+        def _eh_roster_json(caminho: str) -> bool:
+            nome_arquivo = os.path.basename(os.path.normpath(str(caminho or "").strip())).casefold()
+            return nome_arquivo == "roster.json"
+
         try:
             from Dados.config import obter_season_atual
 
             arquivo = obter_season_atual(self.categoria_atual)
             if arquivo:
-                return str(arquivo).strip()
+                caminho = str(arquivo).strip()
+                if caminho and not _eh_roster_json(caminho):
+                    return caminho
         except Exception:
             pass
 
@@ -1122,13 +1228,20 @@ class ExportarImportarMixin:
         if isinstance(arquivos_por_categoria, dict):
             arquivo = arquivos_por_categoria.get(self.categoria_atual, "")
             if arquivo:
-                return str(arquivo).strip()
+                caminho = str(arquivo).strip()
+                if caminho and not _eh_roster_json(caminho):
+                    return caminho
 
-        return str(self.banco.get("arquivo_season", "")).strip()
+        caminho = str(self.banco.get("arquivo_season", "")).strip()
+        if caminho and not _eh_roster_json(caminho):
+            return caminho
+        return ""
 
     def _salvar_arquivo_season_atual(self, arquivo: str) -> None:
         caminho = str(arquivo or "").strip()
         if not caminho:
+            return
+        if os.path.basename(os.path.normpath(caminho)).casefold() == "roster.json":
             return
 
         self.banco.setdefault("arquivo_season_por_categoria", {})
@@ -1141,6 +1254,15 @@ class ExportarImportarMixin:
             definir_season_atual(self.categoria_atual, caminho)
         except Exception:
             pass
+
+    def _salvar_arquivo_roster_atual(self, arquivo: str) -> None:
+        caminho = str(arquivo or "").strip()
+        if not caminho:
+            return
+
+        self.banco.setdefault("arquivo_roster_por_categoria", {})
+        self.banco["arquivo_roster_por_categoria"][self.categoria_atual] = caminho
+        salvar_banco(self.banco)
 
     def _obter_evento_jogavel_atual(self) -> dict | None:
         metodo = getattr(self, "_get_proximo_evento_exibicao", None)
@@ -1575,7 +1697,7 @@ class ExportarImportarMixin:
                     f"Salvo em:\n{arquivo}\n\n"
                     f"(Nenhum piloto encontrado para o Production Car Challenge)"
                 )
-            self._salvar_arquivo_season_atual(arquivo)
+            self._salvar_arquivo_roster_atual(arquivo)
             if not silencioso:
                 QMessageBox.information(
                     self,
@@ -1583,7 +1705,7 @@ class ExportarImportarMixin:
                     mensagem,
                 )
         else:
-            self._salvar_arquivo_season_atual(arquivo)
+            self._salvar_arquivo_roster_atual(arquivo)
             resumo = self._resumir_carros_multimarca(drivers, self.categoria_atual)
             if not silencioso:
                 QMessageBox.information(
@@ -2096,6 +2218,19 @@ class ExportarImportarMixin:
         except (TypeError, ValueError):
             rodada_resultado = int(self.banco.get("rodada_atual", 1) or 1)
 
+        pontos_antes = self._snapshot_pontos_categoria(self.categoria_atual)
+        lesoes_antes = self._snapshot_lesoes_categoria(self.categoria_atual)
+        ordens_antes = self._snapshot_ordens_hierarquia_categoria(self.categoria_atual)
+
+        corrida_ref: dict[str, Any] = {}
+        calendario = self.banco.get("calendario", [])
+        if isinstance(calendario, list):
+            indice_rodada = rodada_resultado - 1
+            if 0 <= indice_rodada < len(calendario):
+                corrida_item = calendario[indice_rodada]
+                if isinstance(corrida_item, dict):
+                    corrida_ref = dict(corrida_item)
+
         aplicados = self._aplicar_classificacao_por_nome(
             classificacao,
             rodada=rodada_resultado,
@@ -2112,28 +2247,43 @@ class ExportarImportarMixin:
 
         calcular_pontos_equipes(self.banco, self.categoria_atual)
         simular_paralelo = getattr(self, "_simular_rodada_todas_categorias", None)
+        resumo_outras_raw: dict[str, Any] = {}
         if callable(simular_paralelo):
-            simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
+            retorno = simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
+            if isinstance(retorno, dict):
+                resumo_outras_raw = retorno
         self._avancar_rodada()
         self._atualizar_tudo()
 
-        rodada = rodada_resultado
-        vencedor = str(resultado.get("vencedor", "")).strip() or "Nao identificado"
-        total_resultados = len(classificacao)
-        nao_aplicados = max(0, total_resultados - aplicados)
+        outras_categorias: list[dict[str, Any]] = []
+        for categoria_aux, info in resumo_outras_raw.items():
+            if not isinstance(info, dict):
+                continue
+            outras_categorias.append(
+                {
+                    "categoria_id": categoria_aux,
+                    "categoria_nome": obter_nome_categoria(str(categoria_aux)),
+                    "rodada": int(info.get("rodada", 0) or 0),
+                    "vencedor": str(info.get("vencedor", "Sem vencedor") or "Sem vencedor"),
+                }
+            )
 
-        mensagem = (
-            "Sincronizado com sucesso!\n\n"
-            f"Rodada: {rodada}\n"
-            f"Vencedor: {vencedor}\n"
-            f"Resultados aplicados: {aplicados}/{total_resultados}"
+        self._abrir_resultado_corrida_detalhado(
+            classificacao=classificacao,
+            corrida=corrida_ref,
+            categoria_id=self.categoria_atual,
+            rodada=rodada_resultado,
+            pontos_antes=pontos_antes,
+            lesoes_antes=lesoes_antes,
+            ordens_antes=ordens_antes,
+            outras_categorias=outras_categorias,
         )
-        if nao_aplicados:
-            mensagem += f"\nPilotos nao aplicados: {nao_aplicados}"
 
-        QMessageBox.information(self, "Resultado sincronizado", mensagem)
-
-    def _aplicar_resultado_importado(self, resultado: dict) -> int:
+    def _aplicar_resultado_importado(
+        self,
+        resultado: dict,
+        retornar_classificacao: bool = False,
+    ) -> int | tuple[int, list[dict[str, Any]]]:
         resultados = resultado.get("resultados", [])
         melhor_nome = None
         melhor_tempo = None
@@ -2166,6 +2316,8 @@ class ExportarImportarMixin:
             foi_corrida_jogador=True,
         )
         calcular_pontos_equipes(self.banco, self.categoria_atual)
+        if retornar_classificacao:
+            return aplicados, classificacao
         return aplicados
 
     def _proximo_resultado(self) -> None:
@@ -2226,6 +2378,10 @@ class ExportarImportarMixin:
             )
             return
 
+        pontos_antes = self._snapshot_pontos_categoria(self.categoria_atual)
+        lesoes_antes = self._snapshot_lesoes_categoria(self.categoria_atual)
+        ordens_antes = self._snapshot_ordens_hierarquia_categoria(self.categoria_atual)
+
         if evento_pcc:
             try:
                 from Logica.series_especiais import aplicar_resultado_pcc
@@ -2252,7 +2408,23 @@ class ExportarImportarMixin:
                 origem="importada",
             )
         else:
-            aplicados = self._aplicar_resultado_importado(resultado)
+            retorno_importado = self._aplicar_resultado_importado(
+                resultado,
+                retornar_classificacao=True,
+            )
+            if (
+                isinstance(retorno_importado, tuple)
+                and len(retorno_importado) == 2
+            ):
+                aplicados = int(retorno_importado[0] or 0)
+                classificacao = (
+                    retorno_importado[1]
+                    if isinstance(retorno_importado[1], list)
+                    else []
+                )
+            else:
+                aplicados = int(retorno_importado or 0)
+                classificacao = []
 
         if aplicados <= 0:
             QMessageBox.warning(
@@ -2263,22 +2435,48 @@ class ExportarImportarMixin:
             )
             return
 
+        resumo_outras_raw: dict[str, Any] = {}
         if not evento_pcc:
             simular_paralelo = getattr(self, "_simular_rodada_todas_categorias", None)
             if callable(simular_paralelo):
-                simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
+                retorno = simular_paralelo(rodada_referencia=int(self.banco.get("rodada_atual", 1)))
+                if isinstance(retorno, dict):
+                    resumo_outras_raw = retorno
             self._avancar_rodada()
         else:
             salvar_banco(self.banco)
         self._atualizar_tudo()
 
-        mensagem = f"Rodada {rodada} processada com sucesso."
-        if evento_pcc:
-            mensagem = f"Production Car Challenge - rodada {rodada} processada com sucesso."
+        outras_categorias: list[dict[str, Any]] = []
+        for categoria_aux, info in resumo_outras_raw.items():
+            if not isinstance(info, dict):
+                continue
+            outras_categorias.append(
+                {
+                    "categoria_id": categoria_aux,
+                    "categoria_nome": obter_nome_categoria(str(categoria_aux)),
+                    "rodada": int(info.get("rodada", 0) or 0),
+                    "vencedor": str(info.get("vencedor", "Sem vencedor") or "Sem vencedor"),
+                }
+            )
 
-        QMessageBox.information(
-            self,
-            "Resultado Importado",
-            mensagem,
+        corrida_ref = {}
+        if isinstance(self.banco.get("calendario", []), list):
+            indice = rodada - 1
+            calendario = self.banco.get("calendario", [])
+            if isinstance(calendario, list) and 0 <= indice < len(calendario):
+                item_corrida = calendario[indice]
+                if isinstance(item_corrida, dict):
+                    corrida_ref = dict(item_corrida)
+
+        self._abrir_resultado_corrida_detalhado(
+            classificacao=classificacao if isinstance(classificacao, list) else [],
+            corrida=corrida_ref,
+            categoria_id=self.categoria_atual,
+            rodada=rodada,
+            pontos_antes=pontos_antes,
+            lesoes_antes=lesoes_antes,
+            ordens_antes=ordens_antes,
+            outras_categorias=outras_categorias,
         )
 

@@ -26,11 +26,8 @@ Funções legadas (Módulos 1–3)::
 """
 
 import copy
-import logging
 import random
 from typing import Any
-
-logger = logging.getLogger(__name__)
 
 # ── Novos exports do Módulo 4 ─────────────────────────────────────────────────
 from .models import (
@@ -47,7 +44,6 @@ from .models import (
     RaceResult,
     SimulationContext,
     calculate_points,
-    DEFAULT_POINTS_SYSTEM,
 )
 from .weather import (
     determine_weather,
@@ -58,18 +54,10 @@ from .weather import (
 from .incidents import (
     PilotIncidentProfile,
     roll_for_incident,
-    calculate_mechanical_failure_chance,
-    calculate_driver_error_chance,
-    calculate_collision_chance,
     gerar_lesao,
 )
-from .qualifying import simulate_qualifying, calculate_quali_score
-from .race import simulate_race, simulate_segment, calculate_segment_score
-from .safety_car import (
-    should_deploy_safety_car,
-    create_safety_car_period,
-    apply_safety_car_effect,
-)
+from .qualifying import simulate_qualifying
+from .race import simulate_race
 from .race_simulator import RaceSimulator, SimulationConfig, get_simulator
 
 # ── Funções legadas (mantidas para compatibilidade com código existente) ───────
@@ -97,13 +85,11 @@ except ImportError:
 try:
     from Logica.pilotos import (
         atualizar_stats_piloto,
-        normalizar_aggression,
         obter_pilotos_categoria,
         resetar_stats_temporada,
     )
 except ImportError:
     def atualizar_stats_piloto(p, **kw): return 0
-    def normalizar_aggression(v): return v
     def obter_pilotos_categoria(banco, cat): return []
     def resetar_stats_temporada(p): pass
 
@@ -1000,8 +986,6 @@ def simular_temporada_completa(banco, categoria_id, ano, num_corridas=None):
             equipe["pontos_historico"]  = equipe.get("pontos_historico", 0)  + equipe.get("pontos_temporada", 0)
             equipe["vitorias_equipe"]   = equipe.get("vitorias_equipe",  0)  + equipe.get("vitorias_temporada", 0)
 
-    categoria_nome = next((c["nome"] for c in CATEGORIAS if c["id"] == categoria_id), categoria_id)
-
     pilotos_ordenados = sorted(
         pilotos,
         key=lambda p: (-p.get("pontos_temporada", 0), -p.get("vitorias_temporada", 0)),
@@ -1056,6 +1040,7 @@ __all__ = [
     "SafetyCarPeriod", "RaceResult", "SimulationContext",
     "PilotIncidentProfile", "roll_for_incident",
     "simulate_qualifying", "simulate_race", "determine_weather", "calculate_points",
+    "get_weather_modifier", "get_rain_skill_penalty", "calculate_pilot_rain_penalty",
     # Legado
     "calcular_performance_piloto", "simular_corrida",
     "simular_classificacao_categoria",

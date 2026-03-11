@@ -7,12 +7,10 @@ import logging
 import random
 
 from Dados.constantes import (
-    NIVEIS_CATEGORIA,
     CATEGORIAS_CONFIG,
-    REGRAS_PROMOCAO,
     _EQUIPES_POR_CATEGORIA,
     # backward-compat imports
-    NOMES_EQUIPES, PREFIXOS_EXTRA, SUFIXOS_EXTRA, CORES_EQUIPES,
+    PREFIXOS_EXTRA, SUFIXOS_EXTRA, CORES_EQUIPES,
 )
 from Dados.banco import obter_proximo_id
 
@@ -389,93 +387,6 @@ def rebaixar_equipe(equipe, nova_categoria):
     equipe["reputacao"] = max(0, equipe.get("reputacao", 50) - 8)
 
     logger.info("REBAIXAMENTO: %s — %s → %s", equipe.get("nome", "???"), cat_anterior, nova_categoria)
-
-
-def processar_promocao_rebaixamento(banco, categoria_id, ano_atual):
-    """
-    Processa promoções e rebaixamentos de equipes de uma categoria.
-
-    Usa REGRAS_PROMOCAO para determinar quantas equipes sobem/descem.
-
-    Args:
-        banco: banco de dados
-        categoria_id: ID da categoria a processar
-        ano_atual: ano atual
-
-    Returns:
-        dict: {"promovidas": [...], "rebaixadas": [...]}
-    """
-    regras = REGRAS_PROMOCAO.get(categoria_id)
-    if not regras:
-        return {"promovidas": [], "rebaixadas": []}
-
-    classificacao = obter_classificacao_equipes(banco, categoria_id)
-    resultado = {"promovidas": [], "rebaixadas": []}
-    if not classificacao:
-        return resultado
-
-    # Tenta usar o fluxo simples do Modulo 8; fallback para regras locais se indisponivel.
-    promovidas = []
-    rebaixadas = []
-    try:
-        from Logica.promocao import processar_promocoes_simples
-
-        resultados = {}
-        for posicao, equipe in enumerate(classificacao, start=1):
-            resultados[str(equipe.get("id", ""))] = {
-                "posicao": posicao,
-                "pontos": int(equipe.get("pontos_temporada", 0)),
-                "total": len(classificacao),
-            }
-
-        promovidas, rebaixadas = processar_promocoes_simples(
-            equipes=classificacao,
-            resultados=resultados,
-            temporada=ano_atual,
-            categoria_id=categoria_id,
-        )
-    except Exception:
-        # Backward compat: aceita "sobem" e "ssobem".
-        n_sobem = int(regras.get("sobem", regras.get("ssobem", 0)) or 0)
-        n_descem = int(regras.get("descem", 0) or 0)
-        promovidas = classificacao[:n_sobem] if n_sobem > 0 else []
-        rebaixadas = classificacao[-n_descem:] if n_descem > 0 else []
-
-    destino_subida = regras.get("destino_subida")
-    if destino_subida:
-        for equipe in promovidas:
-            promover_equipe(equipe, destino_subida)
-            salvar_historico_temporada(
-                equipe,
-                ano_atual,
-                posicao_campeonato=classificacao.index(equipe) + 1,
-                titulo=False,
-            )
-            resultado["promovidas"].append(equipe)
-
-    # Backward compat: aceita destino_descida e origem_descida.
-    destino_descida = regras.get("destino_descida", regras.get("origem_descida"))
-    if destino_descida:
-        for equipe in rebaixadas:
-            if isinstance(destino_descida, dict):
-                classe = equipe.get("classe_endurance") or equipe.get("carro_classe")
-                nova_cat = destino_descida.get(classe) if classe else None
-            else:
-                nova_cat = destino_descida
-
-            if not nova_cat:
-                continue
-
-            rebaixar_equipe(equipe, nova_cat)
-            salvar_historico_temporada(
-                equipe,
-                ano_atual,
-                posicao_campeonato=classificacao.index(equipe) + 1,
-                titulo=False,
-            )
-            resultado["rebaixadas"].append(equipe)
-
-    return resultado
 
 
 # ============================================================

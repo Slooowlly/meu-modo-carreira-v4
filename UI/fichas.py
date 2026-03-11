@@ -4040,49 +4040,159 @@ class FichaEquipe(QDialog):
         content = QWidget()
         lay = QVBoxLayout(content)
         lay.setContentsMargins(18, 18, 18, 18)
-        lay.setSpacing(12)
+        lay.setSpacing(14)
 
-        pan_p, lay_p = self._criar_painel("\U0001f465 Pilotos")
-        for label, chave in (("Piloto 1", "piloto_1"), ("Piloto 2", "piloto_2")):
-            nome = str(self.equipe.get(chave, "") or "—").strip() or "—"
+        def _clamp_pct(valor: Any, padrao: int = 0) -> int:
+            try:
+                numero = int(round(float(valor)))
+            except (TypeError, ValueError):
+                numero = int(padrao)
+            return max(0, min(100, numero))
+
+        def _linha_info(chave: str, valor: str) -> QWidget:
             linha = QWidget()
             ll = QHBoxLayout(linha)
             ll.setContentsMargins(0, 2, 0, 2)
             ll.setSpacing(8)
-            lbl_k = QLabel(label)
+
+            lbl_k = QLabel(chave)
             lbl_k.setFont(Fontes.texto_pequeno())
             lbl_k.setStyleSheet(f"color: {self._tema.get('text_secondary', Cores.TEXTO_SECONDARY)};")
-            lbl_k.setFixedWidth(70)
-            lbl_v = QLabel(nome)
+            lbl_k.setFixedWidth(180)
+
+            lbl_v = QLabel(valor)
+            lbl_v.setWordWrap(True)
             lbl_v.setFont(Fontes.texto_normal())
             lbl_v.setStyleSheet(f"color: {self._tema.get('text_primary', Cores.TEXTO_PRIMARY)};")
+
             ll.addWidget(lbl_k)
             ll.addWidget(lbl_v, 1)
-            lay_p.addWidget(linha)
+            return linha
+
+        pan_perf, lay_perf = self._criar_painel("Performance")
+        car_perf = _clamp_pct(self.equipe.get("car_performance", self.equipe.get("aero", 50)), 50)
+        budget = _clamp_pct(self.equipe.get("budget", self.equipe.get("orcamento", 50)), 50)
+        facilities = _clamp_pct(self.equipe.get("facilities", self.equipe.get("infraestrutura", 50)), 50)
+        engineering = _clamp_pct(self.equipe.get("engineering_quality", self.equipe.get("pitcrew_skill", 50)), 50)
+        reputacao = _clamp_pct(self.equipe.get("reputacao", 50), 50)
+
+        lay_perf.addWidget(self._criar_barra_progresso("Car Performance", car_perf))
+        lay_perf.addWidget(self._criar_barra_progresso("Budget", budget))
+        lay_perf.addWidget(self._criar_barra_progresso("Facilities", facilities))
+        lay_perf.addWidget(self._criar_barra_progresso("Engineering", engineering))
+        lay_perf.addWidget(self._criar_barra_progresso("Reputacao", reputacao))
+
+        try:
+            morale_raw = float(self.equipe.get("morale", 1.0) or 1.0)
+        except (TypeError, ValueError):
+            morale_raw = 1.0
+        morale_norm = morale_raw / 100.0 if morale_raw > 2.0 else morale_raw
+        if morale_norm < 0.9:
+            morale_txt = "Baixo"
+        elif morale_norm > 1.1:
+            morale_txt = "Alto"
+        else:
+            morale_txt = "Normal"
+        lay_perf.addWidget(_linha_info("Morale", f"{morale_txt} ({morale_norm:.2f})"))
+        lay.addWidget(pan_perf)
+
+        pan_p, lay_p = self._criar_painel("Pilotos")
+        pilotos_por_id = {
+            str(p.get("id")): p
+            for p in self.banco.get("pilotos", [])
+            if isinstance(p, dict)
+        }
+        hierarquia = self.equipe.get("hierarquia")
+        if not isinstance(hierarquia, dict):
+            hierarquia = {}
+
+        n1_id = str(hierarquia.get("n1_id", self.equipe.get("piloto_numero_1")) or "")
+        n2_id = str(hierarquia.get("n2_id", self.equipe.get("piloto_numero_2")) or "")
+        p1_ref = pilotos_por_id.get(n1_id, {})
+        p2_ref = pilotos_por_id.get(n2_id, {})
+
+        nome_n1 = str(
+            p1_ref.get("nome", self.equipe.get("piloto_1", "Sem piloto"))
+            or "Sem piloto"
+        ).strip()
+        nome_n2 = str(
+            p2_ref.get("nome", self.equipe.get("piloto_2", "Sem piloto"))
+            or "Sem piloto"
+        ).strip()
+        skill_n1 = _clamp_pct(p1_ref.get("skill", 0), 0)
+        skill_n2 = _clamp_pct(p2_ref.get("skill", 0), 0)
+
+        status_hierarquia = str(hierarquia.get("status", "estavel") or "estavel").strip().lower()
+        mapa_status = {
+            "estavel": "Estavel",
+            "tensao": "Tensao",
+            "reavaliacao": "Reavaliacao",
+            "invertido": "Invertido",
+        }
+        status_txt = mapa_status.get(status_hierarquia, "Estavel")
+
+        lay_p.addWidget(_linha_info("N1", f"{nome_n1} (skill {skill_n1})"))
+        lay_p.addWidget(_linha_info("N2", f"{nome_n2} (skill {skill_n2})"))
+        lay_p.addWidget(_linha_info("Status hierarquia", status_txt))
         lay.addWidget(pan_p)
 
-        pan_a, lay_a = self._criar_painel("\U0001f4ca Atributos")
-        orcamento = self._as_int(self.equipe.get("orcamento"), 50)
-        pitcrew = self._as_int(self.equipe.get("pitcrew_skill"), 50)
-        try:
-            risco = int(float(self.equipe.get("estrategia_risco", 0.5)) * 100)
-        except (TypeError, ValueError):
-            risco = 50
-        lay_a.addWidget(self._criar_barra_progresso("Orçamento", orcamento))
-        lay_a.addWidget(self._criar_barra_progresso("Pit Crew", pitcrew))
-        lay_a.addWidget(self._criar_barra_progresso("Risco Estratégia", risco))
-        exp = str(self.equipe.get("expectativa", "") or "—").strip() or "—"
-        lbl_exp = QLabel(f"Expectativa:  {exp}")
-        lbl_exp.setFont(Fontes.texto_pequeno())
-        lbl_exp.setStyleSheet(f"color: {self._tema.get('text_secondary', Cores.TEXTO_SECONDARY)};")
-        lay_a.addWidget(lbl_exp)
-        lay.addWidget(pan_a)
+        pan_i, lay_i = self._criar_painel("Informacoes")
+        categoria_id = str(self.equipe.get("categoria", self.equipe.get("categoria_id", "")) or "").strip()
+        categoria_txt = obter_nome_categoria(categoria_id) if categoria_id else "-"
+        marca = str(
+            self.equipe.get("marca", self.equipe.get("carro_marca", self.equipe.get("carro", "-")))
+            or "-"
+        ).strip() or "-"
+        temporadas_categoria = self._as_int(self.equipe.get("temporadas_na_categoria"), 0)
+
+        equipes_cat = [
+            equipe_ref
+            for equipe_ref in self.banco.get("equipes", [])
+            if isinstance(equipe_ref, dict)
+            and bool(equipe_ref.get("ativa", True))
+            and str(equipe_ref.get("categoria", equipe_ref.get("categoria_id", "")) or "").strip() == categoria_id
+        ]
+        total_equipes = max(1, len(equipes_cat))
+        posicao_construtores = self._calcular_posicao_equipe()
+        posicao_txt = f"{posicao_construtores}º / {total_equipes}" if posicao_construtores > 0 else "-"
+
+        lay_i.addWidget(_linha_info("Categoria", categoria_txt))
+        lay_i.addWidget(_linha_info("Carro/Marca", marca))
+        lay_i.addWidget(_linha_info("Temporadas na categoria", str(temporadas_categoria)))
+        lay_i.addWidget(_linha_info("Posicao construtores", posicao_txt))
+        lay.addWidget(pan_i)
+
+        pan_h, lay_h = self._criar_painel("Historico")
+        historico = self._historico_equipe()
+        if historico:
+            for item in historico[:4]:
+                ano = self._as_int(item.get("ano"), 0)
+                pos = self._as_int(item.get("posicao"), 0)
+                pts = self._as_int(item.get("pontos"), 0)
+                if ano <= 0:
+                    continue
+                pos_txt = f"{pos}º construtores" if pos > 0 else "sem posicao"
+                lbl = QLabel(f"{ano}: {categoria_txt} - {pos_txt} ({pts} pts)")
+                lbl.setWordWrap(True)
+                lbl.setFont(Fontes.texto_pequeno())
+                lbl.setStyleSheet(f"color: {self._tema.get('text_primary', Cores.TEXTO_PRIMARY)};")
+                lay_h.addWidget(lbl)
+        else:
+            texto_historico = self.equipe.get("historico", [])
+            if isinstance(texto_historico, list) and texto_historico:
+                for entrada in texto_historico[:4]:
+                    lbl = QLabel(str(entrada))
+                    lbl.setWordWrap(True)
+                    lbl.setFont(Fontes.texto_pequeno())
+                    lbl.setStyleSheet(f"color: {self._tema.get('text_primary', Cores.TEXTO_PRIMARY)};")
+                    lay_h.addWidget(lbl)
+            else:
+                lay_h.addWidget(_linha_info("Registros", "Sem historico de construtores."))
+        lay.addWidget(pan_h)
 
         lay.addStretch()
         scroll.setWidget(content)
         return scroll
-
-
     # ── Helpers de dados históricos ─────────────────────────────────────────
 
     def _historico_equipe(self) -> list:

@@ -985,8 +985,13 @@ def criar_banco_vazio():
         "historico_temporadas": [],
         "historico_temporadas_completas": [],
         "historico_geral": [],
+        "historico_avaliacoes": [],
+        "historico_milestones": [],
         "campeoes": [],
         "aposentados": [],
+        "noticias": [],
+        "race_weekend": {},
+        "ultimo_alerta_contrato": {},
         "recordes": _recordes_padrao(),
         "mercado": _mercado_padrao(),
     }
@@ -1071,8 +1076,13 @@ def _validar_campos_banco(banco):
         "historico_temporadas": [],
         "historico_temporadas_completas": [],
         "historico_geral": [],
+        "historico_avaliacoes": [],
+        "historico_milestones": [],
         "campeoes": [],
         "aposentados": [],
+        "noticias": [],
+        "race_weekend": {},
+        "ultimo_alerta_contrato": {},
         "recordes": _recordes_padrao(),
         "mercado": _mercado_padrao(),
     }
@@ -1112,8 +1122,11 @@ def _validar_campos_banco(banco):
         "historico_temporadas",
         "historico_temporadas_completas",
         "historico_geral",
+        "historico_avaliacoes",
+        "historico_milestones",
         "campeoes",
         "aposentados",
+        "noticias",
         "calendario",
     )
     for campo in campos_lista:
@@ -1126,6 +1139,8 @@ def _validar_campos_banco(banco):
         "arquivo_season_por_categoria",
         "max_drivers_por_categoria",
         "volta_rapida_por_rodada",
+        "race_weekend",
+        "ultimo_alerta_contrato",
     )
     for campo in campos_dict:
         if not isinstance(banco.get(campo), dict):

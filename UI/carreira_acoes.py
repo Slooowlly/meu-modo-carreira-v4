@@ -6,6 +6,9 @@ from __future__ import annotations
 from typing import Any, Iterable
 
 from Dados.constantes import CATEGORIAS_CONFIG, PONTOS_POR_POSICAO  # type: ignore
+from Dados.banco import salvar_banco
+from Logica.milestones import verificar_milestones
+from Logica.noticias import GeradorNoticias
 from Utils.iracing_conteudo import (
     categoria_para_conteudo,
     jogador_possui_categoria,
@@ -15,6 +18,7 @@ from Utils.iracing_conteudo import (
     normalizar_conteudo_iracing,
     pista_cobranca_slug,
 )
+from Utils.helpers import obter_nome_categoria
 
 
 class CarreiraAcoesBaseMixin:
@@ -131,6 +135,185 @@ class CarreiraAcoesBaseMixin:
         total = self._obter_total_rodadas_temporada()
         return max(total - self._corridas_disputadas(), 0)
 
+    def _obter_gerador_noticias(self) -> GeradorNoticias:
+        return GeradorNoticias(self.banco)
+
+    def _registrar_resultado_categoria_ui(
+        self,
+        *,
+        categoria_id: str | None,
+        rodada: int | None,
+        corrida: dict[str, Any] | None,
+        classificacao: list[dict[str, Any]] | None,
+    ) -> None:
+        """Persiste ultimo resultado detalhado por categoria para exibicao na UI."""
+        categoria = str(categoria_id or self.categoria_atual or "").strip()
+        if not categoria:
+            return
+        if not isinstance(classificacao, list) or not classificacao:
+            return
+
+        try:
+            rodada_int = int(rodada if rodada is not None else self.banco.get("rodada_atual", 1))
+        except (TypeError, ValueError):
+            rodada_int = int(self.banco.get("rodada_atual", 1) or 1)
+        rodada_int = max(1, rodada_int)
+
+        circuito = ""
+        if isinstance(corrida, dict):
+            circuito = str(corrida.get("circuito", corrida.get("nome", "")) or "").strip()
+
+        linhas: list[dict[str, Any]] = []
+        for indice, item in enumerate(classificacao, start=1):
+            if not isinstance(item, dict):
+                continue
+            nome = str(
+                item.get("piloto_nome", item.get("piloto", item.get("nome", "Piloto")))
+                or "Piloto"
+            ).strip() or "Piloto"
+            equipe = str(item.get("equipe_nome", item.get("equipe", "")) or "").strip()
+            dnf = bool(item.get("dnf", False))
+            try:
+                pos = int(
+                    item.get(
+                        "posicao_campeonato",
+                        item.get("posicao_classe", item.get("posicao", indice)),
+                    )
+                    or indice
+                )
+            except (TypeError, ValueError):
+                pos = indice
+            linhas.append(
+                {
+                    "piloto_nome": nome,
+                    "equipe_nome": equipe,
+                    "posicao": pos,
+                    "dnf": dnf,
+                    "motivo_dnf": str(item.get("motivo_dnf", "") or "").strip(),
+                    "pontos": int(item.get("pontos", 0) or 0),
+                    "is_jogador": bool(item.get("is_jogador", False)),
+                }
+            )
+
+        if not linhas:
+            return
+
+        raiz = self.banco.get("ultimos_resultados_por_categoria")
+        if not isinstance(raiz, dict):
+            raiz = {}
+            self.banco["ultimos_resultados_por_categoria"] = raiz
+
+        raiz[categoria] = {
+            "categoria_id": categoria,
+            "categoria_nome": obter_nome_categoria(categoria),
+            "rodada": rodada_int,
+            "circuito": circuito,
+            "classificacao": linhas[:50],
+            "timestamp": int(self.banco.get("rodada_atual", rodada_int) or rodada_int),
+        }
+
+    def _registrar_noticias_pos_corrida(
+        self,
+        *,
+        categoria_id: str | None,
+        rodada: int | None,
+        corrida: dict[str, Any] | None,
+        classificacao: list[dict[str, Any]],
+        lesoes: list[dict[str, Any]] | None = None,
+        ordens: list[str] | None = None,
+        outras_categorias: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Gera noticias de corrida/incidentes para alimentar o feed."""
+        categoria = str(categoria_id or self.categoria_atual or "").strip()
+        if not categoria:
+            return
+        categoria_nome = obter_nome_categoria(categoria)
+        ano_atual = int(self.banco.get("ano_atual", 2024) or 2024)
+        try:
+            rodada_int = int(rodada if rodada is not None else self.banco.get("rodada_atual", 1))
+        except (TypeError, ValueError):
+            rodada_int = int(self.banco.get("rodada_atual", 1) or 1)
+        rodada_int = max(1, rodada_int)
+
+        circuito = ""
+        if isinstance(corrida, dict):
+            circuito = str(corrida.get("circuito", corrida.get("nome", "")) or "").strip()
+
+        gerador = self._obter_gerador_noticias()
+        gerador.gerar_noticia_corrida(
+            resultado=classificacao,
+            categoria_nome=categoria_nome,
+            rodada=rodada_int,
+            temporada=ano_atual,
+            circuito=circuito,
+            categoria_id=categoria,
+        )
+
+        dnfs = [
+            item
+            for item in classificacao
+            if isinstance(item, dict) and bool(item.get("dnf", False))
+        ]
+        if len(dnfs) >= 2:
+            nomes = ", ".join(
+                str(item.get("piloto_nome", "Piloto") or "Piloto")
+                for item in dnfs[:3]
+                if isinstance(item, dict)
+            )
+            if nomes:
+                gerador.gerar_noticia_incidente(
+                    incidente=f"DNFs notaveis na largada: {nomes}.",
+                    categoria_nome=categoria_nome,
+                    rodada=rodada_int,
+                    temporada=ano_atual,
+                    categoria_id=categoria,
+                )
+
+        for lesao in (lesoes or []):
+            if not isinstance(lesao, dict):
+                continue
+            gerador.gerar_noticia_lesao(
+                piloto_nome=str(lesao.get("piloto_nome", "Piloto") or "Piloto"),
+                lesao=lesao,
+                temporada=ano_atual,
+                rodada=rodada_int,
+                tipo_evento="lesao",
+            )
+
+        for ordem in (ordens or []):
+            texto = str(ordem or "").strip()
+            if not texto:
+                continue
+            equipe_nome = "Equipe"
+            if ":" in texto:
+                equipe_nome = str(texto.split(":", 1)[0]).strip() or "Equipe"
+            gerador.gerar_noticia_hierarquia(
+                equipe_nome=equipe_nome,
+                evento=texto,
+                temporada=ano_atual,
+                rodada=rodada_int,
+            )
+
+        for item in (outras_categorias or []):
+            if not isinstance(item, dict):
+                continue
+            categoria_aux = str(item.get("categoria_id", "") or "").strip()
+            if not categoria_aux:
+                continue
+            rodada_aux = int(item.get("rodada", 0) or 0)
+            vencedor = str(item.get("vencedor", "Piloto") or "Piloto")
+            gerador.gerar_noticia_corrida(
+                resultado=[{"piloto_nome": vencedor, "dnf": False}],
+                categoria_nome=str(
+                    item.get("categoria_nome", obter_nome_categoria(categoria_aux))
+                    or obter_nome_categoria(categoria_aux)
+                ),
+                rodada=rodada_aux,
+                temporada=ano_atual,
+                circuito="",
+                categoria_id=categoria_aux,
+            )
+
     def _obter_mapa_volta_rapida_por_rodada(
         self,
         categoria_id: str | None = None,
@@ -223,7 +406,7 @@ class CarreiraAcoesBaseMixin:
             mapa_categoria.pop(chave_rodada, None)
 
     # ============================================================
-    # ORDENAÇÃO
+    # ORDENACAO
     # ============================================================
 
     def _ordenar_pilotos_campeonato(
@@ -257,6 +440,492 @@ class CarreiraAcoesBaseMixin:
         )
 
     # ============================================================
+    # SNAPSHOTS / POS-CORRIDA
+    # ============================================================
+
+    def _snapshot_pontos_categoria(self, categoria_id: str | None = None) -> dict[str, int]:
+        """Registra pontos atuais por piloto (id) para calculo de delta no pos-corrida."""
+        mapa: dict[str, int] = {}
+        for piloto in self._obter_pilotos_da_categoria(categoria_id):
+            piloto_id = self._normalizar_id_hierarquia(piloto.get("id"))
+            if not piloto_id:
+                continue
+            try:
+                mapa[piloto_id] = int(piloto.get("pontos_temporada", 0) or 0)
+            except (TypeError, ValueError):
+                mapa[piloto_id] = 0
+        return mapa
+
+    def _snapshot_lesoes_categoria(self, categoria_id: str | None = None) -> dict[str, int]:
+        """Registra corridas restantes de lesao ativa por piloto."""
+        mapa: dict[str, int] = {}
+        for piloto in self._obter_pilotos_da_categoria(categoria_id):
+            piloto_id = self._normalizar_id_hierarquia(piloto.get("id"))
+            if not piloto_id:
+                continue
+            lesao = piloto.get("lesao")
+            corridas = 0
+            if isinstance(lesao, dict):
+                try:
+                    corridas = int(lesao.get("corridas_restantes", 0) or 0)
+                except (TypeError, ValueError):
+                    corridas = 0
+            mapa[piloto_id] = max(0, corridas)
+        return mapa
+
+    def _snapshot_ordens_hierarquia_categoria(
+        self,
+        categoria_id: str | None = None,
+    ) -> dict[str, dict[str, int]]:
+        """Registra contadores de ordens obedecidas/desobedecidas por equipe."""
+        categoria = str(categoria_id or self.categoria_atual or "").strip()
+        mapa: dict[str, dict[str, int]] = {}
+        if not categoria:
+            return mapa
+
+        for equipe in self.banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if not bool(equipe.get("ativa", True)):
+                continue
+            categoria_eq = str(equipe.get("categoria", equipe.get("categoria_id", "")) or "").strip()
+            if categoria_eq != categoria:
+                continue
+
+            equipe_id = self._normalizar_id_hierarquia(equipe.get("id"))
+            if not equipe_id:
+                continue
+
+            hierarquia = equipe.get("hierarquia")
+            if not isinstance(hierarquia, dict):
+                hierarquia = {}
+
+            try:
+                obed = int(hierarquia.get("ordens_obedecidas", 0) or 0)
+            except (TypeError, ValueError):
+                obed = 0
+            try:
+                desob = int(hierarquia.get("ordens_desobedecidas", 0) or 0)
+            except (TypeError, ValueError):
+                desob = 0
+
+            mapa[equipe_id] = {
+                "obedecidas": max(0, obed),
+                "desobedecidas": max(0, desob),
+            }
+        return mapa
+
+    def _coletar_ordens_equipe_disparadas(
+        self,
+        categoria_id: str | None,
+        snapshot_antes: dict[str, dict[str, int]] | None = None,
+    ) -> list[str]:
+        """Gera resumo textual de ordens de equipe ocorridas na rodada."""
+        categoria = str(categoria_id or self.categoria_atual or "").strip()
+        if not categoria:
+            return []
+
+        antes = snapshot_antes if isinstance(snapshot_antes, dict) else {}
+        depois = self._snapshot_ordens_hierarquia_categoria(categoria)
+        linhas: list[str] = []
+
+        for equipe in self.banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if str(equipe.get("categoria", equipe.get("categoria_id", "")) or "").strip() != categoria:
+                continue
+            equipe_id = self._normalizar_id_hierarquia(equipe.get("id"))
+            if not equipe_id:
+                continue
+            reg_antes = antes.get(equipe_id, {})
+            reg_depois = depois.get(equipe_id, {})
+
+            obed_antes = int(reg_antes.get("obedecidas", 0) or 0)
+            obed_depois = int(reg_depois.get("obedecidas", 0) or 0)
+            desob_antes = int(reg_antes.get("desobedecidas", 0) or 0)
+            desob_depois = int(reg_depois.get("desobedecidas", 0) or 0)
+
+            delta_obed = max(0, obed_depois - obed_antes)
+            delta_desob = max(0, desob_depois - desob_antes)
+            if delta_obed <= 0 and delta_desob <= 0:
+                continue
+
+            nome_equipe = str(equipe.get("nome", "Equipe") or "Equipe")
+            if delta_obed > 0:
+                linhas.append(f"{nome_equipe}: ordem de equipe obedecida ({delta_obed}x)")
+            if delta_desob > 0:
+                linhas.append(f"{nome_equipe}: ordem de equipe ignorada ({delta_desob}x)")
+
+        return linhas[:10]
+
+    def _coletar_lesoes_novas_categoria(
+        self,
+        categoria_id: str | None,
+        snapshot_antes: dict[str, int] | None = None,
+    ) -> list[dict[str, Any]]:
+        """Lista lesoes novas detectadas apos a corrida."""
+        antes = snapshot_antes if isinstance(snapshot_antes, dict) else {}
+        saida: list[dict[str, Any]] = []
+        for piloto in self._obter_pilotos_da_categoria(categoria_id):
+            piloto_id = self._normalizar_id_hierarquia(piloto.get("id"))
+            if not piloto_id:
+                continue
+            lesao = piloto.get("lesao")
+            if not isinstance(lesao, dict):
+                continue
+            try:
+                corridas = int(lesao.get("corridas_restantes", 0) or 0)
+            except (TypeError, ValueError):
+                corridas = 0
+            if corridas <= 0:
+                continue
+            corridas_antes = int(antes.get(piloto_id, 0) or 0)
+            if corridas_antes > 0:
+                continue
+            saida.append(
+                {
+                    "piloto_nome": str(piloto.get("nome", "Piloto") or "Piloto"),
+                    "tipo": str(lesao.get("tipo", "desconhecida") or "desconhecida"),
+                    "corridas_restantes": corridas,
+                }
+            )
+        return saida
+
+    def _montar_campeonato_pos_corrida(
+        self,
+        categoria_id: str | None,
+        pontos_antes: dict[str, int] | None = None,
+        limite: int = 20,
+    ) -> list[dict[str, Any]]:
+        """Monta classificacao do campeonato com delta de pontos da rodada."""
+        pilotos = self._ordenar_pilotos_campeonato(self._obter_pilotos_da_categoria(categoria_id))
+        mapa_antes = pontos_antes if isinstance(pontos_antes, dict) else {}
+        saida: list[dict[str, Any]] = []
+        for posicao, piloto in enumerate(pilotos[: max(1, limite)], start=1):
+            piloto_id = self._normalizar_id_hierarquia(piloto.get("id"))
+            try:
+                pontos = int(piloto.get("pontos_temporada", 0) or 0)
+            except (TypeError, ValueError):
+                pontos = 0
+            pontos_prev = int(mapa_antes.get(piloto_id, pontos) or pontos)
+            saida.append(
+                {
+                    "posicao": posicao,
+                    "nome": str(piloto.get("nome", "Piloto") or "Piloto"),
+                    "pontos": pontos,
+                    "delta": pontos - pontos_prev,
+                    "is_jogador": bool(piloto.get("is_jogador", False)),
+                }
+            )
+        return saida
+
+    def _enriquecer_classificacao_para_dialogo(
+        self,
+        classificacao: list[dict[str, Any]],
+        categoria_id: str | None,
+    ) -> list[dict[str, Any]]:
+        """Normaliza classificacao para exibir no dialogo detalhado."""
+        pilotos_por_id = {
+            self._normalizar_id_hierarquia(p.get("id")): p
+            for p in self._obter_pilotos_da_categoria(categoria_id)
+            if isinstance(p, dict)
+        }
+        saida: list[dict[str, Any]] = []
+        for indice, entrada in enumerate(classificacao, start=1):
+            if not isinstance(entrada, dict):
+                continue
+            piloto_id = self._normalizar_id_hierarquia(entrada.get("piloto_id", entrada.get("id")))
+            piloto_ref = pilotos_por_id.get(piloto_id, {})
+
+            nome = str(
+                entrada.get("piloto_nome", entrada.get("piloto", entrada.get("nome", "")))
+                or piloto_ref.get("nome", "Piloto")
+            ).strip() or "Piloto"
+            equipe = str(entrada.get("equipe_nome", piloto_ref.get("equipe_nome", "")) or "").strip()
+            dnf = bool(entrada.get("dnf", False))
+            volta_rapida = bool(entrada.get("volta_rapida", False))
+            try:
+                posicao = int(
+                    entrada.get(
+                        "posicao_campeonato",
+                        entrada.get("posicao_classe", entrada.get("posicao", indice)),
+                    )
+                )
+            except (TypeError, ValueError):
+                posicao = indice
+
+            pontos = entrada.get("pontos")
+            if isinstance(pontos, bool):
+                pontos = None
+            if pontos is None:
+                pontos_calc = self._calcular_pontos_da_posicao(posicao=posicao, volta_rapida=volta_rapida, dnf=dnf)
+            else:
+                try:
+                    pontos_calc = int(pontos)
+                except (TypeError, ValueError):
+                    pontos_calc = self._calcular_pontos_da_posicao(
+                        posicao=posicao,
+                        volta_rapida=volta_rapida,
+                        dnf=dnf,
+                    )
+
+            saida.append(
+                {
+                    "piloto_id": piloto_id,
+                    "piloto_nome": nome,
+                    "equipe_nome": equipe,
+                    "dnf": dnf,
+                    "motivo_dnf": str(entrada.get("motivo_dnf", "") or "").strip(),
+                    "volta_rapida": volta_rapida,
+                    "pontos": pontos_calc,
+                    "posicao_campeonato": posicao,
+                    "incidentes": int(entrada.get("incidentes", 0) or 0),
+                    "is_jogador": bool(
+                        entrada.get("is_jogador", piloto_ref.get("is_jogador", False))
+                    ),
+                }
+            )
+        return saida
+
+    def _consumir_notificacoes_hierarquia_pendentes(self) -> list[dict[str, Any]]:
+        """Retorna notificacoes de hierarquia acumuladas e limpa fila."""
+        pendentes = getattr(self, "_notificacoes_hierarquia_pendentes", [])
+        if not isinstance(pendentes, list):
+            pendentes = []
+        self._notificacoes_hierarquia_pendentes = []
+        return [item for item in pendentes if isinstance(item, dict)]
+
+    def _mostrar_notificacoes_hierarquia(self, notificacoes: list[dict[str, Any]]) -> None:
+        """Exibe notificacoes de mudanca de hierarquia da equipe do jogador."""
+        if not isinstance(notificacoes, list) or not notificacoes:
+            return
+
+        try:
+            from PySide6.QtWidgets import QMessageBox
+        except Exception:
+            return
+
+        for item in notificacoes:
+            if not isinstance(item, dict):
+                continue
+            texto = str(item.get("notificacao", "") or "").strip()
+            if not texto:
+                continue
+            destaque = bool(item.get("destaque", False))
+            titulo = "Hierarquia interna"
+            if destaque:
+                titulo = "Mudanca importante de hierarquia"
+                QMessageBox.warning(self, titulo, texto)
+            else:
+                QMessageBox.information(self, titulo, texto)
+
+    def _abrir_resultado_corrida_detalhado(
+        self,
+        *,
+        classificacao: list[dict[str, Any]],
+        corrida: dict[str, Any] | None,
+        categoria_id: str | None,
+        rodada: int | None = None,
+        pontos_antes: dict[str, int] | None = None,
+        lesoes_antes: dict[str, int] | None = None,
+        ordens_antes: dict[str, dict[str, int]] | None = None,
+        outras_categorias: list[dict[str, Any]] | None = None,
+    ) -> None:
+        """Abre dialogo detalhado de pos-corrida e, ao final, mostra notificacoes de hierarquia."""
+        classificacao_ok = self._enriquecer_classificacao_para_dialogo(classificacao, categoria_id)
+        campeonato = self._montar_campeonato_pos_corrida(categoria_id, pontos_antes=pontos_antes, limite=20)
+        lesoes = self._coletar_lesoes_novas_categoria(categoria_id, snapshot_antes=lesoes_antes)
+        ordens = self._coletar_ordens_equipe_disparadas(categoria_id, snapshot_antes=ordens_antes)
+
+        destaques: list[str] = []
+        volta_rapida = next(
+            (
+                item
+                for item in classificacao_ok
+                if isinstance(item, dict) and bool(item.get("volta_rapida", False))
+            ),
+            None,
+        )
+        if isinstance(volta_rapida, dict):
+            destaques.append(f"Volta mais rapida: {volta_rapida.get('piloto_nome', 'Piloto')}")
+        dnfs = [item for item in classificacao_ok if isinstance(item, dict) and bool(item.get("dnf", False))]
+        if dnfs:
+            destaques.append(f"DNFs na corrida: {len(dnfs)}")
+
+        jogador_res = next(
+            (
+                item
+                for item in classificacao_ok
+                if isinstance(item, dict) and bool(item.get("is_jogador", False))
+            ),
+            None,
+        )
+        if isinstance(jogador_res, dict):
+            if bool(jogador_res.get("dnf", False)):
+                destaques.append("Seu resultado: DNF")
+            else:
+                pos_jog = int(jogador_res.get("posicao_campeonato", 0) or 0)
+                destaques.append(f"Seu resultado: P{pos_jog}")
+
+        nome_evento = "Corrida"
+        if isinstance(corrida, dict):
+            nome_evento = str(corrida.get("circuito", corrida.get("nome", "Corrida")) or "Corrida")
+        categoria_txt = obter_nome_categoria(str(categoria_id or self.categoria_atual or "").strip())
+        rodada_txt = str(rodada if rodada is not None else "-")
+        try:
+            rodada_int = int(rodada if rodada is not None else self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_int = int(self.banco.get("rodada_atual", 1) or 1)
+        titulo = f"Resultado - Rodada {rodada_txt} - {nome_evento}"
+        if categoria_txt:
+            titulo = f"{titulo} ({categoria_txt})"
+
+        dados_dialogo = {
+            "titulo": titulo,
+            "classificacao": classificacao_ok,
+            "destaques": destaques,
+            "lesoes_rodada": lesoes,
+            "ordens_equipe": ordens,
+            "campeonato_atualizado": campeonato,
+            "outras_categorias": outras_categorias if isinstance(outras_categorias, list) else [],
+        }
+
+        self._registrar_resultado_categoria_ui(
+            categoria_id=categoria_id,
+            rodada=rodada,
+            corrida=corrida if isinstance(corrida, dict) else {},
+            classificacao=classificacao_ok,
+        )
+        self._registrar_noticias_pos_corrida(
+            categoria_id=categoria_id,
+            rodada=rodada,
+            corrida=corrida if isinstance(corrida, dict) else {},
+            classificacao=classificacao_ok,
+            lesoes=lesoes,
+            ordens=ordens,
+            outras_categorias=outras_categorias if isinstance(outras_categorias, list) else [],
+        )
+
+        avaliacao = None
+        obter_avaliacao = getattr(self, "_obter_expectativa_e_avaliacao", None)
+        if callable(obter_avaliacao):
+            try:
+                _exp, avaliacao = obter_avaliacao(
+                    persistir_historico=True,
+                    rodada_ref=rodada_int,
+                )
+            except Exception:
+                avaliacao = None
+
+        processar_alerta = getattr(self, "_processar_alerta_contratual_pos_corrida", None)
+        if callable(processar_alerta):
+            try:
+                processar_alerta(rodada_int, avaliacao)
+            except Exception:
+                pass
+
+        novos_milestones: list[dict[str, Any]] = []
+        jogador = self._obter_jogador() if hasattr(self, "_obter_jogador") else None
+        if isinstance(jogador, dict):
+            try:
+                total_incidentes = int(
+                    jogador_res.get("incidentes", 0) if isinstance(jogador_res, dict) else 0
+                )
+            except (TypeError, ValueError):
+                total_incidentes = 0
+            novos_milestones = verificar_milestones(
+                jogador,
+                self.banco,
+                contexto={
+                    "tipo": "pos_corrida",
+                    "rodada": rodada_int,
+                    "resultado": jogador_res if isinstance(jogador_res, dict) else {},
+                    "total_incidentes": total_incidentes,
+                },
+            )
+            if novos_milestones:
+                gerador = self._obter_gerador_noticias()
+                temporada = int(self.banco.get("ano_atual", 2024) or 2024)
+                categoria_chave = str(categoria_id or self.categoria_atual or "").strip()
+                categoria_nome = obter_nome_categoria(categoria_chave)
+                for milestone in novos_milestones:
+                    try:
+                        gerador.gerar_noticia_milestone(
+                            jogador=jogador,
+                            milestone=milestone,
+                            temporada=temporada,
+                            rodada=rodada_int,
+                            categoria_id=categoria_chave,
+                            categoria_nome=categoria_nome,
+                        )
+                    except Exception:
+                        pass
+        salvar_banco(self.banco)
+
+        aberto = False
+        usar_embutido = False
+        consumir_embutido = getattr(self, "_rw_receber_resultado_dialogo", None)
+        if callable(consumir_embutido):
+            try:
+                usar_embutido = bool(
+                    consumir_embutido(
+                        dados_dialogo,
+                        rodada_resultado=rodada_int,
+                    )
+                )
+                aberto = usar_embutido
+            except Exception:
+                usar_embutido = False
+                aberto = False
+
+        if not usar_embutido:
+            try:
+                from UI.dialogs import ResultadoCorridaDialog
+
+                dialogo = ResultadoCorridaDialog(dados_dialogo, parent=self)
+                dialogo.exec()
+                aberto = True
+            except Exception:
+                aberto = False
+
+        if not aberto:
+            try:
+                from PySide6.QtWidgets import QMessageBox
+
+                linhas = [titulo, ""]
+                for item in classificacao_ok[:12]:
+                    if not isinstance(item, dict):
+                        continue
+                    nome = str(item.get("piloto_nome", "Piloto") or "Piloto")
+                    if bool(item.get("dnf", False)):
+                        motivo = str(item.get("motivo_dnf", "") or "").strip() or "abandono"
+                        linhas.append(f"DNF {nome} - {motivo}")
+                    else:
+                        pos = int(item.get("posicao_campeonato", 0) or 0)
+                        pts = int(item.get("pontos", 0) or 0)
+                        linhas.append(f"P{pos:02d} {nome} (+{pts} pts)")
+                QMessageBox.information(self, "Resultado detalhado", "\n".join(linhas))
+            except Exception:
+                pass
+
+        if novos_milestones:
+            try:
+                from UI.dialogs import MilestoneDialog
+
+                for milestone in novos_milestones:
+                    if not isinstance(milestone, dict):
+                        continue
+                    dialogo_m = MilestoneDialog(milestone, parent=self)
+                    dialogo_m.exec()
+            except Exception:
+                pass
+
+        pendentes = [
+            item
+            for item in self._consumir_notificacoes_hierarquia_pendentes()
+            if bool(item.get("envolve_jogador", False)) and str(item.get("notificacao", "")).strip()
+        ]
+        self._mostrar_notificacoes_hierarquia(pendentes)
     # BUSCA DE PILOTOS
     # ============================================================
 
@@ -475,6 +1144,8 @@ class CarreiraAcoesBaseMixin:
             rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
         rodada_atual = max(1, rodada_atual)
         total_corridas = max(1, self._obter_total_rodadas_categoria(categoria))
+        jogador = self._obter_jogador() if hasattr(self, "_obter_jogador") else None
+        jogador_id = self._normalizar_id_hierarquia(jogador.get("id")) if isinstance(jogador, dict) else ""
 
         pilotos_por_id = {
             self._normalizar_id_hierarquia(p.get("id")): p
@@ -548,9 +1219,11 @@ class CarreiraAcoesBaseMixin:
             hierarquia = equipe.get("hierarquia")
             if not isinstance(hierarquia, dict):
                 hierarquia = {}
+            status_anterior = str(hierarquia.get("status", "estavel") or "estavel").strip().lower()
 
             n1_id = hierarquia.get("n1_id") or equipe.get("piloto_numero_1")
             n2_id = hierarquia.get("n2_id") or equipe.get("piloto_numero_2")
+            jogador_era_n1 = bool(jogador_id and self._ids_equivalentes_resultado(n1_id, jogador_id))
 
             res_n1 = next((r for r in resultados if self._ids_equivalentes_resultado(r.get("piloto_id"), n1_id)), None)
             res_n2 = next((r for r in resultados if self._ids_equivalentes_resultado(r.get("piloto_id"), n2_id)), None)
@@ -626,14 +1299,73 @@ class CarreiraAcoesBaseMixin:
                 n2_atual["papel"] = "numero_2"
             equipe["hierarquia"] = hierarquia
 
+            status_novo = str(hierarquia.get("status", "estavel") or "estavel").strip().lower()
+            status_mudou = status_novo != status_anterior
+            jogador_env = bool(
+                jogador_id
+                and (
+                    self._ids_equivalentes_resultado(hierarquia.get("n1_id"), jogador_id)
+                    or self._ids_equivalentes_resultado(hierarquia.get("n2_id"), jogador_id)
+                )
+            )
+            jogador_agora_n1 = bool(jogador_id and self._ids_equivalentes_resultado(hierarquia.get("n1_id"), jogador_id))
+            jogador_virou_n1 = bool(jogador_env and (not jogador_era_n1) and jogador_agora_n1)
+            jogador_perdeu_n1 = bool(jogador_env and jogador_era_n1 and (not jogador_agora_n1))
+
+            notificacao = ""
+            destaque = False
+            if status_mudou and jogador_env:
+                if status_novo == "tensao":
+                    notificacao = (
+                        "Tensao interna: voce esta superando seu companheiro de equipe "
+                        "com frequencia nas ultimas corridas."
+                    )
+                elif status_novo == "invertido":
+                    if jogador_virou_n1:
+                        notificacao = "Promocao: voce foi promovido a piloto N1 da equipe."
+                        destaque = True
+                    elif jogador_perdeu_n1:
+                        notificacao = "Rebaixamento: voce perdeu a posicao de piloto N1."
+                        destaque = True
+                    else:
+                        notificacao = "A hierarquia interna da equipe foi invertida."
+                elif status_novo == "estavel" and status_anterior == "tensao":
+                    notificacao = "A situacao interna da equipe estabilizou."
+
+            if status_mudou:
+                evento_noticia = ""
+                if status_novo == "tensao":
+                    evento_noticia = "Tensao entre os pilotos por resultados recentes."
+                elif status_novo == "invertido":
+                    evento_noticia = "Hierarquia invertida apos sequencia de desempenho do N2."
+                elif status_novo == "reavaliacao":
+                    evento_noticia = "Equipe iniciou reavaliacao de hierarquia."
+                elif status_novo == "estavel" and status_anterior == "tensao":
+                    evento_noticia = "Situacao interna estabilizada."
+                if evento_noticia:
+                    self._obter_gerador_noticias().gerar_noticia_hierarquia(
+                        equipe_nome=str(equipe.get("nome", "Equipe") or "Equipe"),
+                        evento=evento_noticia,
+                        temporada=int(self.banco.get("ano_atual", 2024) or 2024),
+                        rodada=rodada_atual,
+                    )
+
             atualizacoes.append(
                 {
                     "equipe_id": equipe_id,
-                    "status": hierarquia.get("status", "estavel"),
+                    "status": status_novo,
+                    "status_anterior": status_anterior,
+                    "status_novo": status_novo,
+                    "status_mudou": status_mudou,
                     "corridas_n2_a_frente": int(hierarquia.get("corridas_n2_a_frente", 0) or 0),
                     "inversao": inversao,
                     "rodada": rodada_atual,
                     "foi_corrida_jogador": bool(foi_corrida_jogador),
+                    "envolve_jogador": jogador_env,
+                    "jogador_virou_n1": jogador_virou_n1,
+                    "jogador_perdeu_n1": jogador_perdeu_n1,
+                    "notificacao": notificacao,
+                    "destaque": destaque,
                 }
             )
 
@@ -971,12 +1703,23 @@ class CarreiraAcoesBaseMixin:
                 categoria_id=self.categoria_atual,
                 rodada=rodada,
             )
-            self._atualizar_hierarquia_pos_corrida(
+            atualizacoes_hierarquia = self._atualizar_hierarquia_pos_corrida(
                 resultado_corrida=classificacao,
                 categoria_id=self.categoria_atual,
                 rodada=rodada,
                 foi_corrida_jogador=foi_corrida_jogador,
             )
+            if isinstance(atualizacoes_hierarquia, list):
+                pendentes = getattr(self, "_notificacoes_hierarquia_pendentes", [])
+                if not isinstance(pendentes, list):
+                    pendentes = []
+                pendentes.extend(
+                    item
+                    for item in atualizacoes_hierarquia
+                    if isinstance(item, dict)
+                    and bool(item.get("status_mudou", False))
+                )
+                self._notificacoes_hierarquia_pendentes = pendentes
 
         return aplicados
 
@@ -1061,11 +1804,22 @@ class CarreiraAcoesBaseMixin:
                 categoria_id=self.categoria_atual,
                 rodada=rodada,
             )
-            self._atualizar_hierarquia_pos_corrida(
+            atualizacoes_hierarquia = self._atualizar_hierarquia_pos_corrida(
                 resultado_corrida=classificacao,
                 categoria_id=self.categoria_atual,
                 rodada=rodada,
                 foi_corrida_jogador=foi_corrida_jogador,
             )
+            if isinstance(atualizacoes_hierarquia, list):
+                pendentes = getattr(self, "_notificacoes_hierarquia_pendentes", [])
+                if not isinstance(pendentes, list):
+                    pendentes = []
+                pendentes.extend(
+                    item
+                    for item in atualizacoes_hierarquia
+                    if isinstance(item, dict)
+                    and bool(item.get("status_mudou", False))
+                )
+                self._notificacoes_hierarquia_pendentes = pendentes
 
         return aplicados

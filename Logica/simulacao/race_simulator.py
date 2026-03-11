@@ -13,7 +13,6 @@ from .models import (
     SimulationContext,
     WeatherCondition,
     RaceDriverResult,
-    QualifyingResult,
     calculate_points,
 )
 from .qualifying import simulate_qualifying

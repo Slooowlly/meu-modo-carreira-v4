@@ -1,10 +1,10 @@
-﻿from __future__ import annotations
+from __future__ import annotations
 
 from typing import Any
 
 from PySide6.QtWidgets import QMessageBox
 
-from Dados.banco import salvar_banco
+from Dados.banco import _validar_campos_banco, salvar_banco
 from Dados.constantes import CATEGORIAS
 from Logica.evolucao.evolucao_manager import EvolucaoManager
 from Logica.equipes import (
@@ -20,6 +20,7 @@ from Logica.pilotos import (
 from Logica.promocao import PromocaoManager, relatorio_to_dict
 from Logica.series_especiais import inicializar_production_car_challenge
 from UI.carreira_acoes import CarreiraAcoesBaseMixin
+from Utils.helpers import obter_nome_categoria
 
 
 class TemporadaMixin(CarreiraAcoesBaseMixin):
@@ -129,6 +130,8 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
 
         # 7) Validacao final pos-mercado.
         self._sincronizar_rosters()
+        saneamento_pos_mercado = self._sanear_integridade_banco()
+        fechamento["saneamento_pos_mercado"] = dict(saneamento_pos_mercado)
         validacao_ecossistema = self._validar_ecossistema_pos_mercado()
         fechamento["validacao_pos_mercado"] = dict(validacao_ecossistema)
 
@@ -153,6 +156,8 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         self.banco["temporada_concluida"] = False
         inicializar_production_car_challenge(self.banco, self.banco["ano_atual"])
         self._sincronizar_rosters()
+        saneamento_pos_reset = self._sanear_integridade_banco()
+        fechamento["saneamento_pos_reset"] = dict(saneamento_pos_reset)
         self._inicializar_hierarquias(self.banco)
         validacao_final_ok = self._validar_ecossistema_final(self.banco)
         fechamento["validacao_final"] = {
@@ -183,6 +188,8 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             "evolucao_jogador": [],
             "promocao_processada": False,
             "relatorio_promocao": {},
+            "saneamento_pos_mercado": {},
+            "saneamento_pos_reset": {},
             "validacao_pos_mercado": {},
             "validacao_final": {},
         }
@@ -198,6 +205,10 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             fechamento["evolucao_jogador"] = []
         if not isinstance(fechamento.get("relatorio_promocao"), dict):
             fechamento["relatorio_promocao"] = {}
+        if not isinstance(fechamento.get("saneamento_pos_mercado"), dict):
+            fechamento["saneamento_pos_mercado"] = {}
+        if not isinstance(fechamento.get("saneamento_pos_reset"), dict):
+            fechamento["saneamento_pos_reset"] = {}
         if not isinstance(fechamento.get("validacao_pos_mercado"), dict):
             fechamento["validacao_pos_mercado"] = {}
         if not isinstance(fechamento.get("validacao_final"), dict):
@@ -252,6 +263,8 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         fechamento["evolucao_jogador"] = []
         fechamento["promocao_processada"] = False
         fechamento["relatorio_promocao"] = {}
+        fechamento["saneamento_pos_mercado"] = {}
+        fechamento["saneamento_pos_reset"] = {}
         fechamento["validacao_pos_mercado"] = {}
         fechamento["validacao_final"] = {}
 
@@ -261,6 +274,17 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         """
         manager = MercadoManager(self.banco)
         manager._sincronizar_equipes_e_papeis()
+
+    def _sanear_integridade_banco(self) -> dict[str, Any]:
+        """
+        Reaplica validacoes canonicas de schema/integridade apos etapas de alto impacto.
+        """
+        banco_saneado, alterado = _validar_campos_banco(self.banco)
+        if banco_saneado is not self.banco:
+            self.banco = banco_saneado
+        if alterado:
+            self._sincronizar_rosters()
+        return {"alterado": bool(alterado)}
 
     def _inicializar_hierarquias(self, banco: dict[str, Any] | None = None) -> list[dict[str, Any]]:
         """
@@ -316,11 +340,15 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             ("skill", "Skill"),
             ("consistencia", "Consistencia"),
             ("racecraft", "Racecraft"),
+            ("ritmo_classificacao", "Ritmo Quali"),
+            ("gestao_pneus", "Gestao Pneus"),
+            ("habilidade_largada", "Hab. Largada"),
+            ("resistencia_mental", "Resist. Mental"),
             ("fitness", "Fitness"),
-            ("ritmo_classificacao", "Ritmo de classificacao"),
-            ("gestao_pneus", "Gestao de pneus"),
-            ("habilidade_largada", "Largada"),
-            ("resistencia_mental", "Resistencia mental"),
+            ("fator_chuva", "Fator Chuva"),
+            ("fator_clutch", "Fator Clutch"),
+            ("experiencia", "Experiencia"),
+            ("motivacao", "Motivacao"),
         ]
 
     def _snapshot_atributos_jogador(self) -> dict[str, int]:
@@ -348,8 +376,6 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
                 valor_depois = int(round(float(jogador.get(campo, valor_antes) or valor_antes)))
             except (TypeError, ValueError):
                 valor_depois = valor_antes
-            if valor_antes == valor_depois:
-                continue
             deltas.append(
                 {
                     "campo": campo,
@@ -951,6 +977,233 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
         # Limpa metadados de volta rapida por rodada para a nova temporada.
         self.banco["volta_rapida_por_rodada"] = {}
 
+    @staticmethod
+    def _rotulo_papel_mercado_narrativo(papel_raw: Any) -> str:
+        papel = str(papel_raw or "").strip().lower()
+        if papel in {"numero_1", "n1"}:
+            return "N1"
+        if papel in {"numero_2", "n2"}:
+            return "N2"
+        if papel == "reserva":
+            return "Reserva"
+        return papel.upper() if papel else "-"
+
+    def _coletar_transferencias_narrativas(self, resultado_mercado: Any) -> list[dict[str, Any]]:
+        contratos_novos = list(getattr(resultado_mercado, "contratos_novos", []) or [])
+        if not contratos_novos:
+            return []
+
+        pilotos_por_id = {
+            str(p.get("id")): p
+            for p in self.banco.get("pilotos", [])
+            if isinstance(p, dict) and p.get("id") not in (None, "")
+        }
+        vistos: set[tuple[str, str, str, int]] = set()
+        transferencias: list[dict[str, Any]] = []
+
+        for contrato in contratos_novos:
+            piloto_id = str(getattr(contrato, "piloto_id", "") or "")
+            piloto_nome = str(getattr(contrato, "piloto_nome", "Piloto") or "Piloto")
+            destino = str(getattr(contrato, "equipe_nome", "Equipe") or "Equipe")
+            duracao = int(getattr(contrato, "duracao_anos", 1) or 1)
+            papel = self._rotulo_papel_mercado_narrativo(getattr(contrato, "papel", ""))
+            piloto_ref = pilotos_por_id.get(piloto_id, {})
+
+            categoria_destino_id = str(
+                piloto_ref.get("categoria_atual", getattr(contrato, "categoria_id", ""))
+                or getattr(contrato, "categoria_id", "")
+            ).strip()
+            categoria_destino = (
+                obter_nome_categoria(categoria_destino_id) if categoria_destino_id else "-"
+            )
+
+            origem = "Equipe anterior"
+            historico_eq = piloto_ref.get("historico_equipes", [])
+            if isinstance(historico_eq, list) and historico_eq:
+                ult = next(
+                    (
+                        item
+                        for item in reversed(historico_eq)
+                        if isinstance(item, dict)
+                        and str(item.get("equipe_nome", "") or "").strip()
+                    ),
+                    None,
+                )
+                if isinstance(ult, dict):
+                    origem = str(ult.get("equipe_nome", origem) or origem)
+            elif isinstance(piloto_ref, dict):
+                origem = str(
+                    piloto_ref.get("equipe_anterior_nome", piloto_ref.get("origem_equipe", origem))
+                    or origem
+                )
+
+            if origem.strip().casefold() == destino.strip().casefold():
+                continue
+
+            chave = (
+                piloto_nome.strip().casefold(),
+                origem.strip().casefold(),
+                destino.strip().casefold(),
+                duracao,
+            )
+            if chave in vistos:
+                continue
+            vistos.add(chave)
+            transferencias.append(
+                {
+                    "piloto_id": piloto_id,
+                    "piloto": piloto_nome,
+                    "origem": origem,
+                    "destino": destino,
+                    "categoria": categoria_destino,
+                    "papel": papel,
+                    "duracao": duracao,
+                }
+            )
+
+        return transferencias
+
+    def _coletar_aposentadorias_narrativas(self, aposentados: list[dict[str, Any]]) -> list[dict[str, Any]]:
+        if not isinstance(aposentados, list) or not aposentados:
+            return []
+
+        aposentadorias: list[dict[str, Any]] = []
+        pilotos_nome = {
+            str(p.get("nome", "") or "").strip().casefold(): p
+            for p in self.banco.get("pilotos", [])
+            if isinstance(p, dict)
+        }
+        for item in aposentados:
+            if not isinstance(item, dict):
+                continue
+            nome = str(item.get("nome", "Piloto") or "Piloto")
+            ref = pilotos_nome.get(nome.strip().casefold(), {})
+            historico = ref.get("historico_temporadas", [])
+            if isinstance(historico, list):
+                temporadas = len(historico)
+            else:
+                temporadas = 0
+            aposentadorias.append(
+                {
+                    "piloto": nome,
+                    "idade": int(item.get("idade", ref.get("idade", 0)) or 0),
+                    "temporadas": max(1, temporadas),
+                    "titulos": int(ref.get("titulos", 0) or 0),
+                    "vitorias": int(ref.get("vitorias_carreira", 0) or 0),
+                }
+            )
+        return aposentadorias
+
+    def _coletar_rookies_narrativos(self, resultado_mercado: Any) -> list[dict[str, Any]]:
+        rookies_ids = list(getattr(resultado_mercado, "rookies_gerados", []) or [])
+        if not rookies_ids:
+            return []
+        pilotos_por_id = {
+            str(p.get("id")): p for p in self.banco.get("pilotos", []) if isinstance(p, dict)
+        }
+        saida: list[dict[str, Any]] = []
+        for rookie_id in rookies_ids:
+            piloto = pilotos_por_id.get(str(rookie_id), {})
+            if not isinstance(piloto, dict) or not piloto:
+                continue
+            categoria_id = str(piloto.get("categoria_atual", "") or "").strip()
+            saida.append(
+                {
+                    "piloto": str(piloto.get("nome", "Rookie") or "Rookie"),
+                    "idade": int(piloto.get("idade", 0) or 0),
+                    "equipe": str(piloto.get("equipe_nome", "Sem equipe") or "Sem equipe"),
+                    "categoria": obter_nome_categoria(categoria_id) if categoria_id else "-",
+                }
+            )
+        return saida
+
+    def _coletar_mapa_promocoes_visual(
+        self,
+        relatorio_promocao: dict[str, Any] | None,
+    ) -> dict[str, Any]:
+        elite_categorias = {"gt4", "gt3", "endurance"}
+        mapa = {
+            "pro": {"promovidas": [], "rebaixadas": []},
+            "elite": {"promovidas": [], "rebaixadas": []},
+            "equipe_jogador": "",
+        }
+        jogador = self._obter_jogador()
+        if isinstance(jogador, dict):
+            mapa["equipe_jogador"] = str(jogador.get("equipe_nome", "") or "").strip()
+
+        if not isinstance(relatorio_promocao, dict) or not relatorio_promocao:
+            return mapa
+
+        for tipo_lista, chave_destino in (("promocoes", "promovidas"), ("rebaixamentos", "rebaixadas")):
+            movimentos = relatorio_promocao.get(tipo_lista, [])
+            if not isinstance(movimentos, list):
+                continue
+            for mov in movimentos:
+                if not isinstance(mov, dict):
+                    continue
+                origem = str(mov.get("categoria_origem_id", "") or "").strip()
+                destino = str(mov.get("categoria_destino_id", "") or "").strip()
+                equipe = str(mov.get("equipe_nome", "Equipe") or "Equipe")
+                trilha = "elite" if (origem in elite_categorias or destino in elite_categorias) else "pro"
+                mapa[trilha][chave_destino].append(
+                    {
+                        "equipe": equipe,
+                        "origem": obter_nome_categoria(origem) if origem else origem or "-",
+                        "destino": obter_nome_categoria(destino) if destino else destino or "-",
+                        "destaque_jogador": bool(
+                            mapa["equipe_jogador"]
+                            and equipe.strip().casefold() == mapa["equipe_jogador"].strip().casefold()
+                        ),
+                    }
+                )
+        return mapa
+
+    def _registrar_noticias_fim_temporada(
+        self,
+        *,
+        ano: int,
+        transferencias: list[dict[str, Any]],
+        aposentadorias: list[dict[str, Any]],
+        rookies: list[dict[str, Any]],
+        mapa_promocoes: dict[str, Any],
+    ) -> None:
+        gerador = self._obter_gerador_noticias()
+        for item in transferencias[:24]:
+            if not isinstance(item, dict):
+                continue
+            gerador.gerar_noticia_mercado(transferencia=item, temporada=ano)
+        for item in aposentadorias[:20]:
+            if not isinstance(item, dict):
+                continue
+            gerador.gerar_noticia_aposentadoria(piloto=item, temporada=ano)
+        if rookies:
+            gerador.gerar_noticia_rookie(rookies=rookies, temporada=ano)
+
+        for trilha in ("pro", "elite"):
+            bloco = mapa_promocoes.get(trilha, {})
+            if not isinstance(bloco, dict):
+                continue
+            for mov in bloco.get("promovidas", [])[:20]:
+                if not isinstance(mov, dict):
+                    continue
+                gerador.gerar_noticia_promocao(
+                    equipe=str(mov.get("equipe", "Equipe") or "Equipe"),
+                    origem=str(mov.get("origem", "-") or "-"),
+                    destino=str(mov.get("destino", "-") or "-"),
+                    temporada=ano,
+                    tipo_evento="promocao",
+                )
+            for mov in bloco.get("rebaixadas", [])[:20]:
+                if not isinstance(mov, dict):
+                    continue
+                gerador.gerar_noticia_promocao(
+                    equipe=str(mov.get("equipe", "Equipe") or "Equipe"),
+                    origem=str(mov.get("origem", "-") or "-"),
+                    destino=str(mov.get("destino", "-") or "-"),
+                    temporada=ano,
+                    tipo_evento="rebaixamento",
+                )
+
     def _exibir_resumo_temporada(
         self,
         ano: int,
@@ -1003,6 +1256,38 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             item for item in (evolucao_jogador or []) if isinstance(item, dict)
         ]
         if deltas:
+            cresceu = sum(1 for item in deltas if int(item.get("delta", 0) or 0) > 0)
+            declinou = sum(1 for item in deltas if int(item.get("delta", 0) or 0) < 0)
+            estavel = sum(1 for item in deltas if int(item.get("delta", 0) or 0) == 0)
+            ganho_total = sum(max(0, int(item.get("delta", 0) or 0)) for item in deltas)
+            queda_skill_fitness = any(
+                str(item.get("campo", "") or "") in {"skill", "fitness"}
+                and int(item.get("delta", 0) or 0) < 0
+                for item in deltas
+            )
+            delta_motivacao = next(
+                (
+                    int(item.get("delta", 0) or 0)
+                    for item in deltas
+                    if str(item.get("campo", "") or "") == "motivacao"
+                ),
+                0,
+            )
+
+            resumo_evolucao = (
+                f"Resumo: {cresceu} atributos cresceram, {declinou} declinaram, {estavel} sem mudanca."
+            )
+            mensagens_contexto: list[str] = []
+            if ganho_total > 5:
+                mensagens_contexto.append("Temporada de grande evolucao!")
+            if queda_skill_fitness:
+                mensagens_contexto.append("Idade comecando a pesar.")
+            if delta_motivacao > 0:
+                mensagens_contexto.append("Motivacao em alta!")
+            elif delta_motivacao < 0:
+                mensagens_contexto.append("Motivacao em queda - cuidado.")
+            contexto_evolucao = " ".join(mensagens_contexto).strip()
+
             evolucao_linhas.append("Seus atributos mudaram:")
             evolucao_linhas.append("")
             for item in deltas:
@@ -1010,9 +1295,20 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
                 antes = int(item.get("antes", 0) or 0)
                 depois = int(item.get("depois", 0) or 0)
                 delta = int(item.get("delta", 0) or 0)
-                seta = "⬆️" if delta > 0 else "⬇️"
-                evolucao_linhas.append(f"{rotulo}: {antes} -> {depois} ({delta:+d}) {seta}")
+                if delta > 0:
+                    simbolo = "UP"
+                elif delta < 0:
+                    simbolo = "DOWN"
+                else:
+                    simbolo = "EQ"
+                evolucao_linhas.append(f"{rotulo}: {antes} -> {depois} ({delta:+d}) {simbolo}")
+            evolucao_linhas.append("")
+            evolucao_linhas.append(resumo_evolucao)
+            if contexto_evolucao:
+                evolucao_linhas.append(contexto_evolucao)
         else:
+            resumo_evolucao = "Resumo: sem variacoes registradas."
+            contexto_evolucao = ""
             evolucao_linhas.append("Sem mudancas relevantes de atributos do jogador.")
 
         relatorios = [
@@ -1026,6 +1322,11 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
             total_aposentou = sum(1 for item in relatorios if bool(item.get("aposentou", False)))
             evolucao_linhas.append(f"Aposentaram no M6: {total_aposentou}")
 
+        transferencias_narrativas = self._coletar_transferencias_narrativas(resultado_mercado)
+        aposentadorias_narrativas = self._coletar_aposentadorias_narrativas(aposentados)
+        rookies_narrativos = self._coletar_rookies_narrativos(resultado_mercado)
+        mapa_promocoes_visual = self._coletar_mapa_promocoes_visual(relatorio_promocao)
+
         mercado_linhas = []
         if resultado_mercado:
             mercado_linhas.extend(
@@ -1036,55 +1337,126 @@ class TemporadaMixin(CarreiraAcoesBaseMixin):
                     f"Sem vaga (reserva global): {len(resultado_mercado.pilotos_sem_vaga)}",
                     f"Rookies gerados: {len(resultado_mercado.rookies_gerados)}",
                     "",
-                    "Destaques:",
+                    "TRANSFERENCIAS PRINCIPAIS:",
                 ]
             )
-            destaques = list(getattr(resultado_mercado, "movimentacoes_destaque", []) or [])
-            if destaques:
-                for destaque in destaques[:20]:
-                    mercado_linhas.append(f"- {destaque}")
+            if transferencias_narrativas:
+                for item in transferencias_narrativas[:24]:
+                    mercado_linhas.append(
+                        f"- {item['piloto']}: {item['origem']} -> {item['destino']} "
+                        f"({item['categoria']}) - {item['papel']}, {item['duracao']} ano(s)"
+                    )
             else:
-                mercado_linhas.append("- Sem destaques.")
+                mercado_linhas.append("- Sem transferencias relevantes.")
+
+            mercado_linhas.append("")
+            mercado_linhas.append("APOSENTADORIAS:")
+            if aposentadorias_narrativas:
+                for item in aposentadorias_narrativas[:20]:
+                    mercado_linhas.append(
+                        f"- {item['piloto']} ({item['idade']}) - {item['temporadas']} temporada(s), "
+                        f"{item['titulos']} titulo(s), {item['vitorias']} vitoria(s)"
+                    )
+            else:
+                mercado_linhas.append("- Nenhuma aposentadoria registrada.")
+
+            mercado_linhas.append("")
+            mercado_linhas.append("ROOKIES:")
+            if rookies_narrativos:
+                for item in rookies_narrativos[:20]:
+                    mercado_linhas.append(
+                        f"- {item['piloto']} ({item['idade']}) -> {item['equipe']} ({item['categoria']})"
+                    )
+            else:
+                mercado_linhas.append("- Nenhum rookie novo nesta janela.")
         else:
             mercado_linhas.append("Mercado sem dados para esta temporada.")
 
+        jogador_nome = str(jogador.get("nome", "Voce") or "Voce") if isinstance(jogador, dict) else "Voce"
+        equipe_jogador = str(jogador.get("equipe_nome", "Sem equipe") or "Sem equipe") if isinstance(jogador, dict) else "Sem equipe"
+        equipe_ref = next(
+            (
+                equipe
+                for equipe in self.banco.get("equipes", [])
+                if isinstance(equipe, dict)
+                and str(equipe.get("nome", "") or "").strip().casefold() == equipe_jogador.strip().casefold()
+            ),
+            {},
+        )
+        pilotos_equipe = []
+        if isinstance(equipe_ref, dict):
+            for chave in ("piloto_1", "piloto_2"):
+                nome_p = str(equipe_ref.get(chave, "") or "").strip()
+                if nome_p:
+                    pilotos_equipe.append(nome_p)
+        pilotos_equipe_txt = " + ".join(pilotos_equipe) if pilotos_equipe else "line-up indisponivel"
+        sua_equipe_antes = f"{equipe_jogador} - {jogador_nome} + companheiro anterior"
+        sua_equipe_depois = f"{equipe_jogador} - {pilotos_equipe_txt}"
+        entradas_sua_equipe = [
+            item
+            for item in transferencias_narrativas
+            if str(item.get("destino", "") or "").strip().casefold() == equipe_jogador.strip().casefold()
+        ]
+        if entradas_sua_equipe:
+            pilotos_novos = ", ".join(str(item.get("piloto", "Piloto")) for item in entradas_sua_equipe[:2])
+            sua_equipe_depois = f"{equipe_jogador} - {jogador_nome} + {pilotos_novos}"
+
         promocoes_linhas = []
-        if isinstance(relatorio_promocao, dict) and relatorio_promocao:
-            promocoes = relatorio_promocao.get("promocoes", [])
-            rebaixamentos = relatorio_promocao.get("rebaixamentos", [])
-            promocoes_linhas.extend(
-                [
-                    f"Equipes promovidas: {len(promocoes) if isinstance(promocoes, list) else 0}",
-                    f"Equipes rebaixadas: {len(rebaixamentos) if isinstance(rebaixamentos, list) else 0}",
-                    f"Aposentadorias: {len(aposentados)}",
-                    f"Pilotos liberados por clausula: {int(relatorio_promocao.get('total_pilotos_liberados', 0) or 0)}",
-                    "",
-                    "Movimentacoes:",
-                ]
-            )
-            movs = []
-            if isinstance(promocoes, list):
-                movs.extend(promocoes[:12])
-            if isinstance(rebaixamentos, list):
-                movs.extend(rebaixamentos[:12])
-            if movs:
-                for mov in movs:
+        bloco_pro = mapa_promocoes_visual.get("pro", {})
+        bloco_elite = mapa_promocoes_visual.get("elite", {})
+        promocoes_linhas.append("PROMOVIDAS/REBAIXADAS")
+        for titulo, bloco in (("TRILHA PRO", bloco_pro), ("TRILHA ELITE", bloco_elite)):
+            promocoes_linhas.append("")
+            promocoes_linhas.append(f"{titulo}:")
+            promovidas = bloco.get("promovidas", []) if isinstance(bloco, dict) else []
+            rebaixadas = bloco.get("rebaixadas", []) if isinstance(bloco, dict) else []
+            promocoes_linhas.append("  Promovidas:")
+            if promovidas:
+                for mov in promovidas[:20]:
                     if not isinstance(mov, dict):
                         continue
-                    equipe_nome = str(mov.get("equipe_nome", "Equipe") or "Equipe")
-                    origem = str(mov.get("categoria_origem_id", "?") or "?")
-                    destino = str(mov.get("categoria_destino_id", "?") or "?")
-                    promocoes_linhas.append(f"- {equipe_nome}: {origem} -> {destino}")
+                    destaque = " <SUA EQUIPE>" if bool(mov.get("destaque_jogador", False)) else ""
+                    promocoes_linhas.append(
+                        f"    - {mov.get('equipe', 'Equipe')}: {mov.get('origem', '-')} -> {mov.get('destino', '-')}{destaque}"
+                    )
             else:
-                promocoes_linhas.append("- Sem movimentacoes detalhadas.")
-        else:
-            promocoes_linhas.append("Relatorio de promocoes indisponivel.")
+                promocoes_linhas.append("    - Nenhuma")
+            promocoes_linhas.append("  Rebaixadas:")
+            if rebaixadas:
+                for mov in rebaixadas[:20]:
+                    if not isinstance(mov, dict):
+                        continue
+                    destaque = " <SUA EQUIPE>" if bool(mov.get("destaque_jogador", False)) else ""
+                    promocoes_linhas.append(
+                        f"    - {mov.get('equipe', 'Equipe')}: {mov.get('origem', '-')} -> {mov.get('destino', '-')}{destaque}"
+                    )
+            else:
+                promocoes_linhas.append("    - Nenhuma")
+
+        self._registrar_noticias_fim_temporada(
+            ano=ano,
+            transferencias=transferencias_narrativas,
+            aposentadorias=aposentadorias_narrativas,
+            rookies=rookies_narrativos,
+            mapa_promocoes=mapa_promocoes_visual,
+        )
 
         dados_dialogo = {
             "resumo": "\n".join(resumo_linhas),
             "evolucao": "\n".join(evolucao_linhas),
+            "evolucao_detalhada": deltas,
+            "evolucao_resumo": resumo_evolucao,
+            "evolucao_contexto": contexto_evolucao,
             "mercado": "\n".join(mercado_linhas),
             "promocoes": "\n".join(promocoes_linhas),
+            "mercado_narrativo": {
+                "transferencias": transferencias_narrativas,
+                "aposentadorias": aposentadorias_narrativas,
+                "rookies": rookies_narrativos,
+                "sua_equipe_antes": sua_equipe_antes,
+                "sua_equipe_depois": sua_equipe_depois,
+            },
+            "promocoes_mapa": mapa_promocoes_visual,
         }
 
         try:

@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from typing import Any
+
 from PySide6.QtWidgets import QMessageBox
 
 from Dados.constantes import CATEGORIAS, CATEGORIAS_CONFIG
@@ -44,13 +46,16 @@ class SimularMixin:
             return 0
         return max(0, min(corridas))
 
-    def _simular_rodada_todas_categorias(self, rodada_referencia: int | None = None) -> dict[str, int]:
+    def _simular_rodada_todas_categorias(
+        self,
+        rodada_referencia: int | None = None,
+    ) -> dict[str, dict[str, Any]]:
         """
         Avanca categorias nao ativas ate a rodada de referencia.
 
         Nota: neste momento todas usam simulacao completa do M4.
         """
-        from Logica.simulacao import simular_corrida_categoria
+        from Logica.simulacao import simular_corrida_categoria_detalhada
 
         categoria_jogador = str(self.categoria_atual or "").strip()
         try:
@@ -59,7 +64,7 @@ class SimularMixin:
             alvo = 1
         alvo = max(1, alvo)
 
-        simuladas_por_categoria: dict[str, int] = {}
+        simuladas_por_categoria: dict[str, dict[str, Any]] = {}
 
         for categoria in CATEGORIAS:
             categoria_id = str(categoria.get("id", "") or "").strip()
@@ -72,15 +77,29 @@ class SimularMixin:
                 continue
 
             simuladas = 0
+            ultimo_vencedor = ""
+            ultima_rodada = 0
             while rodada_atual_categoria < alvo and rodada_atual_categoria < total_corridas:
                 try:
-                    resultado = simular_corrida_categoria(self.banco, categoria_id)
+                    resultado_payload = simular_corrida_categoria_detalhada(self.banco, categoria_id)
                 except Exception:
                     break
+                resultado = resultado_payload.get("classificacao", []) if isinstance(resultado_payload, dict) else []
                 if not isinstance(resultado, list) or not resultado:
                     break
 
                 rodada_aplicacao = rodada_atual_categoria + 1
+                ultima_rodada = rodada_aplicacao
+                vencedor = next(
+                    (
+                        str(item.get("piloto_nome", item.get("piloto", "Piloto")) or "Piloto")
+                        for item in resultado
+                        if isinstance(item, dict) and not bool(item.get("dnf", False))
+                    ),
+                    "",
+                )
+                if vencedor:
+                    ultimo_vencedor = vencedor
                 aplicar_categoria = getattr(self, "_aplicar_classificacao_categoria", None)
                 if callable(aplicar_categoria):
                     aplicados = aplicar_categoria(
@@ -103,16 +122,51 @@ class SimularMixin:
                 if int(aplicados or 0) <= 0:
                     break
 
+                corrida_ref: dict[str, Any] = {}
+                calendario = self.banco.get("calendario", [])
+                if (
+                    isinstance(calendario, list)
+                    and rodada_aplicacao > 0
+                    and rodada_aplicacao <= len(calendario)
+                    and isinstance(calendario[rodada_aplicacao - 1], dict)
+                ):
+                    corrida_ref = dict(calendario[rodada_aplicacao - 1])
+
+                registrar_resultado = getattr(self, "_registrar_resultado_categoria_ui", None)
+                if callable(registrar_resultado):
+                    registrar_resultado(
+                        categoria_id=categoria_id,
+                        rodada=rodada_aplicacao,
+                        corrida=corrida_ref,
+                        classificacao=resultado,
+                    )
+
+                registrar_noticias = getattr(self, "_registrar_noticias_pos_corrida", None)
+                if callable(registrar_noticias):
+                    registrar_noticias(
+                        categoria_id=categoria_id,
+                        rodada=rodada_aplicacao,
+                        corrida=corrida_ref,
+                        classificacao=resultado,
+                        lesoes=[],
+                        ordens=[],
+                        outras_categorias=[],
+                    )
+
                 calcular_pontos_equipes(self.banco, categoria_id)
                 rodada_atual_categoria += 1
                 simuladas += 1
 
             if simuladas > 0:
-                simuladas_por_categoria[categoria_id] = simuladas
+                simuladas_por_categoria[categoria_id] = {
+                    "simuladas": simuladas,
+                    "rodada": ultima_rodada,
+                    "vencedor": ultimo_vencedor,
+                }
 
         return simuladas_por_categoria
 
-    def _simular_classificacao(self) -> None:
+    def _simular_classificacao(self, *, retornar_resultado: bool = False) -> list[dict[str, Any]] | None:
         corrida = self._get_corrida_atual()
         if not corrida:
             QMessageBox.warning(
@@ -120,7 +174,7 @@ class SimularMixin:
                 "Aviso",
                 "Nao ha corrida disponivel para classificar.",
             )
-            return
+            return None
 
         try:
             from Logica.simulacao import simular_classificacao_categoria
@@ -132,7 +186,10 @@ class SimularMixin:
                     "Aviso",
                     "A classificacao nao retornou resultados validos.",
                 )
-                return
+                return None
+
+            if retornar_resultado:
+                return grid
 
             linhas = [f"Classificacao: {corrida.get('nome', 'Sessao')}", ""]
             for entrada in grid[:20]:
@@ -153,12 +210,14 @@ class SimularMixin:
                 "Grid de Largada",
                 "\n".join(linhas),
             )
+            return None
         except Exception as erro:
             QMessageBox.critical(
                 self,
                 "Erro",
                 f"Erro ao simular classificacao:\n{erro}",
             )
+            return None
 
     def _simular_corrida(self) -> None:
         evento = self._get_proximo_evento_exibicao()
@@ -194,7 +253,7 @@ class SimularMixin:
                 "Voce pode simular normalmente ou confirmar que possui a pista."
             )
 
-            btn_simular = dialogo.addButton("Simular esta corrida", QMessageBox.AcceptRole)
+            dialogo.addButton("Simular esta corrida", QMessageBox.AcceptRole)
             btn_confirmar = dialogo.addButton("Tenho esta pista, correr", QMessageBox.YesRole)
             btn_cancelar = dialogo.addButton("Cancelar", QMessageBox.RejectRole)
             dialogo.exec()
@@ -212,8 +271,17 @@ class SimularMixin:
                     self.banco["conteudo_iracing"] = conteudo
                     salvar_banco(self.banco)
 
+        pontos_antes = self._snapshot_pontos_categoria(self.categoria_atual)
+        lesoes_antes = self._snapshot_lesoes_categoria(self.categoria_atual)
+        ordens_antes = self._snapshot_ordens_hierarquia_categoria(self.categoria_atual)
+        try:
+            rodada_processada = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_processada = 1
+
         try:
             resultado_simulacao = None
+            resumo_outras_categorias: dict[str, dict[str, Any]] = {}
             
             def _calcular():
                 nonlocal resultado_simulacao
@@ -221,10 +289,19 @@ class SimularMixin:
                     from Logica.series_especiais import simular_proximo_evento_pcc
                     resultado_simulacao = simular_proximo_evento_pcc(self.banco)
                 else:
-                    from Logica.simulacao import simular_corrida_categoria
-                    resultado_simulacao = simular_corrida_categoria(self.banco, self.categoria_atual)
+                    from Logica.simulacao import simular_corrida_categoria_detalhada
+
+                    resultado_detalhado = simular_corrida_categoria_detalhada(
+                        self.banco,
+                        self.categoria_atual,
+                    )
+                    if isinstance(resultado_detalhado, dict):
+                        resultado_simulacao = resultado_detalhado.get("classificacao", [])
+                    else:
+                        resultado_simulacao = []
             
             def _aplicar():
+                nonlocal resumo_outras_categorias
                 if evento_pcc:
                     from Logica.series_especiais import aplicar_resultado_pcc
                     aplicados = aplicar_resultado_pcc(
@@ -239,7 +316,7 @@ class SimularMixin:
                     raise Exception("A simulacao foi executada, mas nenhum resultado pode ser aplicado.")
 
                 if not evento_pcc:
-                    self._simular_rodada_todas_categorias(
+                    resumo_outras_categorias = self._simular_rodada_todas_categorias(
                         rodada_referencia=int(self.banco.get("rodada_atual", 1)),
                     )
                     self._avancar_rodada()
@@ -250,9 +327,36 @@ class SimularMixin:
 
             def _finalizar():
                 if resultado_simulacao:
-                    # Chamar o resultado animado se for uma corrida comum onde temos a posição do jogador
-                    # Ou apenas mostrar o resultado
-                    self._mostrar_resultado_corrida(resultado_simulacao, corrida)
+                    outras_categorias = []
+                    for categoria_id, info in (resumo_outras_categorias or {}).items():
+                        if not isinstance(info, dict):
+                            continue
+                        outras_categorias.append(
+                            {
+                                "categoria_id": categoria_id,
+                                "categoria_nome": next(
+                                    (
+                                        str(cat.get("nome", categoria_id))
+                                        for cat in CATEGORIAS
+                                        if str(cat.get("id", "")) == str(categoria_id)
+                                    ),
+                                    str(categoria_id),
+                                ),
+                                "rodada": int(info.get("rodada", 0) or 0),
+                                "vencedor": str(info.get("vencedor", "Sem vencedor") or "Sem vencedor"),
+                            }
+                        )
+
+                    self._abrir_resultado_corrida_detalhado(
+                        classificacao=resultado_simulacao,
+                        corrida=corrida if isinstance(corrida, dict) else {},
+                        categoria_id=self.categoria_atual,
+                        rodada=rodada_processada,
+                        pontos_antes=pontos_antes,
+                        lesoes_antes=lesoes_antes,
+                        ordens_antes=ordens_antes,
+                        outras_categorias=outras_categorias,
+                    )
                     
                     # Mostrar sucesso
                     if hasattr(self, 'mostrar_sucesso_animado'):
@@ -378,33 +482,3 @@ class SimularMixin:
         )
         calcular_pontos_equipes(self.banco, self.categoria_atual)
         return aplicados
-
-    def _mostrar_resultado_corrida(self, resultado: list[dict], corrida: dict) -> None:
-        linhas = [f"Corrida: {corrida.get('nome', 'Corrida')}", ""]
-
-        for posicao, entrada in enumerate(resultado[:10], start=1):
-            entry_name = entrada.get("piloto_nome", "Piloto sem nome")
-            dnf = bool(entrada.get("dnf", False))
-            volta_rapida = bool(entrada.get("volta_rapida", False))
-            pontos = int(entrada.get("pontos", 0) or 0)
-            if pontos <= 0:
-                pontos = self._calcular_pontos_da_posicao(
-                    posicao=int(entrada.get("posicao_campeonato", posicao) or posicao),
-                    volta_rapida=volta_rapida,
-                    dnf=dnf,
-                )
-
-            sufixos: list[str] = []
-            if volta_rapida and not dnf and posicao <= 10:
-                sufixos.append("VR")
-            if dnf:
-                sufixos.append("DNF")
-
-            sufixo = f" ({', '.join(sufixos)})" if sufixos else ""
-            linhas.append(f"P{posicao:02d}  {entry_name}  +{pontos} pts{sufixo}")
-
-        QMessageBox.information(
-            self,
-            "Resultado",
-            "\n".join(linhas),
-        )

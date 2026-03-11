@@ -41,11 +41,14 @@ from PySide6.QtWidgets import (
     QPushButton,
     QGraphicsOpacityEffect,
     QScrollArea,
+    QStackedWidget,
     QTableWidget,
     QTableWidgetItem,
     QTabWidget,
+    QTextEdit,
     QToolButton,
     QStyledItemDelegate,
+    QLineEdit,
     QVBoxLayout,
     QWidget,
 )
@@ -58,7 +61,6 @@ from UI.componentes import (
     BotaoSecondary,
     BotaoSuccess,
     Card,
-    CardMini,
     CardStat,
     CardTitulo,
     LinhaInfo,
@@ -81,8 +83,20 @@ from Logica.pilotos import (
 )
 from Logica.equipes import (
     calcular_pontos_equipes,
+    obter_classificacao_equipes,
     obter_equipe_piloto,
     obter_equipes_categoria,
+)
+from Logica.noticias import listar_noticias_ordenadas
+from Logica.expectativas import (
+    avaliar_desempenho_vs_expectativa,
+    calcular_expectativa_equipe,
+    obter_classificacao_categoria,
+    registrar_avaliacao_historico,
+)
+from Logica.contrato_alertas import (
+    gerar_alerta_contratual,
+    registrar_alerta_contratual,
 )
 from Utils.helpers import obter_nome_categoria
 from Utils.bandeiras import (
@@ -99,6 +113,27 @@ from Logica.series_especiais import (
     obter_proximo_evento_exibicao,
     sincronizar_production_car_challenge,
 )
+
+
+BRIEFINGS_CIRCUITO = {
+    "Summit Point Raceway": (
+        "Circuito curto e tecnico. Poucas oportunidades de ultrapassagem. "
+        "Consistencia e tracao em saida valem muito."
+    ),
+    "Lime Rock Park": (
+        "Circuito rapido e fluido, com pouca margem para erro. "
+        "Gestao de pneus e coragem em curva de alta fazem diferenca."
+    ),
+    "Spa-Francorchamps": (
+        "Um dos circuitos mais exigentes do calendario. "
+        "Setores de alta e clima imprevisivel cobram adaptacao constante."
+    ),
+    "Watkins Glen": (
+        "Trecho misto, alternando curvas lentas e sequencias rapidas. "
+        "Bom compromisso de acerto costuma decidir as disputas."
+    ),
+    "_default": "Circuito desafiador. Prepare-se para uma corrida competitiva.",
+}
 
 
 class BadgeHeatmapDelegate(QStyledItemDelegate):
@@ -755,6 +790,10 @@ class TelaCarreira(
         self._destacar_somente_piloto_tabela: bool = False
         self._equipe_chave_destacada_tabela: str = ""
         self._cor_equipe_destacada_tabela: str = ""
+        self._rw_etapa_atual: int = 0
+        self._rw_quali_resultado: list[dict[str, Any]] = []
+        self._rw_roster_exportado: bool = False
+        self._rw_resultado_dialogo: dict[str, Any] = {}
         self._monitor_iracing = None
         self._monitor_signals = _MonitorResultadosSignals(self)
         self._monitor_signals.resultado_detectado_sync.connect(
@@ -1331,6 +1370,49 @@ class TelaCarreira(
     def _abrir_historia(self):
         return self._delegar_mixin(ConfigMixin, "_abrir_historia")
 
+    def _abrir_perfil_jogador(self):
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            QMessageBox.warning(self, "Aviso", "Jogador nao encontrado.")
+            return
+
+        categoria_jogador = str(jogador.get("categoria_atual", self.categoria_atual) or self.categoria_atual)
+        pilotos_categoria = obter_pilotos_categoria(self.banco, categoria_jogador)
+        pilotos_ordenados = self._ordenar_pilotos_por_desempenho_dashboard(pilotos_categoria)
+        posicao_campeonato = next(
+            (
+                indice + 1
+                for indice, piloto in enumerate(pilotos_ordenados)
+                if isinstance(piloto, dict) and bool(piloto.get("is_jogador", False))
+            ),
+            "-",
+        )
+
+        try:
+            rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_atual = 1
+
+        contexto = {
+            "posicao_campeonato": posicao_campeonato,
+            "total_pilotos": len(pilotos_ordenados),
+            "rodada_atual": rodada_atual,
+            "total_rodadas": int(self._obter_total_rodadas_temporada()),
+        }
+
+        try:
+            from UI.dialogs import PerfilJogadorDialog
+
+            dialogo = PerfilJogadorDialog(
+                banco=self.banco,
+                jogador=jogador,
+                contexto=contexto,
+                parent=self,
+            )
+            dialogo.exec()
+        except Exception as erro:
+            QMessageBox.warning(self, "Aviso", f"Tela de perfil indisponivel.\nErro: {erro}")
+
     def _configurar_pastas(self):
         return self._delegar_mixin(ConfigMixin, "_configurar_pastas")
 
@@ -1344,6 +1426,11 @@ class TelaCarreira(
         return self._delegar_mixin(ExportarImportarMixin, "_exportar_aiseason", silencioso=silencioso)
 
     def _preparar_proxima_corrida(self):
+        if hasattr(self, "tabs"):
+            self._mostrar_aba(1)
+        if hasattr(self, "_rw_stack"):
+            self._rw_ir_para_etapa(0)
+            return None
         return self._exportar_aiseason(silencioso=True)
 
     def _importar_resultado(self):
@@ -1373,6 +1460,8 @@ class TelaCarreira(
             "Ctrl+3": lambda: self._mostrar_aba(2),
             "Ctrl+4": lambda: self._mostrar_aba(3),
             "Ctrl+5": lambda: self._mostrar_aba(4),
+            "Ctrl+6": lambda: self._mostrar_aba(5),
+            "Ctrl+7": lambda: self._mostrar_aba(6),
             "Ctrl+Page Up": lambda: self._navegar_categoria(-1),
             "Ctrl+Page Down": lambda: self._navegar_categoria(1),
         }
@@ -1643,6 +1732,17 @@ class TelaCarreira(
             f"Resultados aplicados: {aplicados}/{total}"
         )
         QMessageBox.information(self, "Resultado sincronizado", mensagem)
+
+        try:
+            pendentes = [
+                item
+                for item in self._consumir_notificacoes_hierarquia_pendentes()
+                if bool(item.get("envolve_jogador", False))
+                and str(item.get("notificacao", "")).strip()
+            ]
+            self._mostrar_notificacoes_hierarquia(pendentes)
+        except Exception:
+            pass
         return True
 
     # ============================================================
@@ -1803,6 +1903,8 @@ class TelaCarreira(
             ("Minha Equipe", 2),
             ("Previsão", 3),
             ("Mercado", 4),
+            ("Notícias", 5),
+            ("Outras Categorias", 6),
         ]
         for titulo, indice in tabs_topo:
             botao = self._criar_botao_navegacao(titulo, indice)
@@ -1814,6 +1916,12 @@ class TelaCarreira(
         self.btn_nav_historia.setCursor(Qt.PointingHandCursor)
         self.btn_nav_historia.clicked.connect(self._abrir_historia)
         nav_layout.addWidget(self.btn_nav_historia)
+
+        self.btn_nav_perfil = QPushButton("Meu Perfil")
+        self.btn_nav_perfil.setObjectName("btn_tab_nav")
+        self.btn_nav_perfil.setCursor(Qt.PointingHandCursor)
+        self.btn_nav_perfil.clicked.connect(self._abrir_perfil_jogador)
+        nav_layout.addWidget(self.btn_nav_perfil)
 
         categorias_nomes = [c["nome"] for c in CATEGORIAS]
         self.combo_categoria = QComboBox()
@@ -1920,7 +2028,7 @@ class TelaCarreira(
 
         self.tabs = QTabWidget()
         self.tabs.setStyleSheet(
-            f"""
+            """
             QTabWidget::pane {{
                 border: none;
                 background-color: transparent;
@@ -1951,6 +2059,14 @@ class TelaCarreira(
         self.tabs.addTab(self.tab_mercado, "💼 Mercado")
         self._indice_aba_mercado = self.tabs.count() - 1
 
+        self.tab_noticias = self._build_tab_noticias()
+        self.tabs.addTab(self.tab_noticias, "📰 Notícias")
+        self._indice_aba_noticias = self.tabs.count() - 1
+
+        self.tab_outras_categorias = self._build_tab_outras_categorias()
+        self.tabs.addTab(self.tab_outras_categorias, "🏁 Outras Categorias")
+        self._indice_aba_outras_categorias = self.tabs.count() - 1
+
         self.tabs.currentChanged.connect(self._atualizar_navegacao_ativa)
         layout.addWidget(self.tabs)
         self._atualizar_navegacao_ativa()
@@ -1964,6 +2080,11 @@ class TelaCarreira(
             QFrame#painel_acoes_dashboard {{
                 background-color: transparent;
                 border: none;
+            }}
+            QFrame#painel_resumo_jogador {{
+                background-color: #111b2a;
+                border: 1px solid {Cores.BORDA};
+                border-radius: 10px;
             }}
             QToolButton#btn_menu_acao {{
                 background-color: transparent;
@@ -1998,6 +2119,52 @@ class TelaCarreira(
         layout = QHBoxLayout(painel)
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(8)
+
+        self.painel_resumo_jogador = QFrame()
+        self.painel_resumo_jogador.setObjectName("painel_resumo_jogador")
+        resumo_layout = QVBoxLayout(self.painel_resumo_jogador)
+        resumo_layout.setContentsMargins(12, 10, 12, 10)
+        resumo_layout.setSpacing(4)
+
+        self.lbl_resumo_jogador_titulo = QLabel("Jogador - Categoria")
+        self.lbl_resumo_jogador_titulo.setFont(Fontes.texto_normal())
+        self.lbl_resumo_jogador_titulo.setStyleSheet(
+            f"color: {Cores.TEXTO_PRIMARY}; border: none; font-weight: 700;"
+        )
+        resumo_layout.addWidget(self.lbl_resumo_jogador_titulo)
+
+        self.lbl_resumo_jogador_l1 = QLabel("Equipe: - | Papel: -")
+        self.lbl_resumo_jogador_l1.setFont(Fontes.texto_pequeno())
+        self.lbl_resumo_jogador_l1.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        resumo_layout.addWidget(self.lbl_resumo_jogador_l1)
+
+        self.lbl_resumo_jogador_l2 = QLabel("Contrato: -")
+        self.lbl_resumo_jogador_l2.setFont(Fontes.texto_pequeno())
+        self.lbl_resumo_jogador_l2.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        resumo_layout.addWidget(self.lbl_resumo_jogador_l2)
+
+        self.lbl_resumo_jogador_l3 = QLabel("Posicao: - | Pontos: -")
+        self.lbl_resumo_jogador_l3.setFont(Fontes.texto_pequeno())
+        self.lbl_resumo_jogador_l3.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        resumo_layout.addWidget(self.lbl_resumo_jogador_l3)
+
+        self.lbl_resumo_jogador_l4 = QLabel("Proxima corrida: -")
+        self.lbl_resumo_jogador_l4.setFont(Fontes.texto_pequeno())
+        self.lbl_resumo_jogador_l4.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        resumo_layout.addWidget(self.lbl_resumo_jogador_l4)
+
+        self.lbl_contrato_alerta = QLabel("Contrato: sem alertas")
+        self.lbl_contrato_alerta.setFont(Fontes.texto_pequeno())
+        self.lbl_contrato_alerta.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+        self.lbl_contrato_alerta.setWordWrap(True)
+        resumo_layout.addWidget(self.lbl_contrato_alerta)
+
+        self.btn_meu_perfil_dashboard = BotaoSecondary("Meu Perfil")
+        self.btn_meu_perfil_dashboard.setMinimumWidth(124)
+        self.btn_meu_perfil_dashboard.clicked.connect(self._abrir_perfil_jogador)
+        resumo_layout.addWidget(self.btn_meu_perfil_dashboard, 0, Qt.AlignRight)
+
+        layout.addWidget(self.painel_resumo_jogador, 1)
         layout.addStretch(1)
 
         acoes = QWidget()
@@ -3000,119 +3167,894 @@ class TelaCarreira(
         layout = QVBoxLayout(widget)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(15)
-
-        evento = self._get_proximo_evento_exibicao()
-        corrida = evento or self._get_corrida_atual()
-
-        card_info = CardTitulo("Informações do GP", "Prepare-se para a corrida")
-
-        self.lbl_gp_nome = QLabel(corrida.get("nome", "—") if corrida else "—")
-        self.lbl_gp_nome.setFont(Fontes.titulo_medio())
-        self.lbl_gp_nome.setStyleSheet(
-            f"color: {Cores.TEXTO_PRIMARY}; border: none; background: transparent;"
-        )
-        card_info.add(self.lbl_gp_nome)
-
-        self.lbl_circuito = QLabel(corrida.get("circuito", "") if corrida else "")
-        self.lbl_circuito.setFont(Fontes.texto_pequeno())
-        self.lbl_circuito.setStyleSheet(
-            f"color: {Cores.TEXTO_SECONDARY}; border: none; background: transparent;"
-        )
-        card_info.add(self.lbl_circuito)
-
-        self.lbl_evento_contexto = QLabel("")
-        self.lbl_evento_contexto.setFont(Fontes.texto_pequeno())
-        self.lbl_evento_contexto.setWordWrap(True)
-        self.lbl_evento_contexto.setStyleSheet(
-            f"color: {Cores.TEXTO_MUTED}; border: none; background: transparent;"
-        )
-        card_info.add(self.lbl_evento_contexto)
-
-        card_info.add(Separador())
-
-        clima = corrida.get("clima", "—") if corrida else "—"
-        temperatura = corrida.get("temperatura", "—") if corrida else "—"
-        voltas = corrida.get("voltas", "—") if corrida else "—"
-
-        cond = QHBoxLayout()
-        cond.setSpacing(10)
-
-        self.card_clima = CardMini("Clima", self._formatar_clima(clima))
-        self.card_temp = CardMini("Temp", self._formatar_temperatura(temperatura))
-        self.card_voltas = CardMini("Voltas", str(voltas))
-
-        cond.addWidget(self.card_clima)
-        cond.addWidget(self.card_temp)
-        cond.addWidget(self.card_voltas)
-        cond.addStretch()
-
-        cond_widget = QWidget()
-        cond_widget.setLayout(cond)
-        card_info.add(cond_widget)
-
-        card_info.add(Separador())
-
-        btn_layout = QHBoxLayout()
-        btn_layout.addStretch()
-
-        btn_quali = BotaoSecondary("🏁 Classificação")
-        btn_quali.clicked.connect(self._simular_classificacao)
-        btn_layout.addWidget(btn_quali)
-
-        btn_corrida = BotaoSuccess("\u25B6  Simular Corrida")
-        btn_corrida.clicked.connect(self._simular_corrida)
-        btn_layout.addWidget(btn_corrida)
-
-        btn_widget = QWidget()
-        btn_widget.setLayout(btn_layout)
-        card_info.add(btn_widget)
-
-        layout.addWidget(card_info)
-
-        card_calendario = CardTitulo("Calendário da Temporada")
-
-        self.lbl_calendario_titulo = QLabel("—")
-        self.lbl_calendario_titulo.setFont(Fontes.texto_normal())
-        self.lbl_calendario_titulo.setStyleSheet(
-            f"color: {Cores.TEXTO_SECONDARY}; border: none; background: transparent;"
-        )
-        card_calendario.add(self.lbl_calendario_titulo)
-
-        self.tabela_calendario = QTableWidget()
-        self.tabela_calendario.setColumnCount(4)
-        self.tabela_calendario.setHorizontalHeaderLabels(
-            ["Etapa", "Pista", "Status", "Resultado"]
-        )
-        self.tabela_calendario.setStyleSheet(Estilos.tabela())
-        self.tabela_calendario.setSelectionMode(QAbstractItemView.NoSelection)
-        self.tabela_calendario.setEditTriggers(QAbstractItemView.NoEditTriggers)
-        self.tabela_calendario.verticalHeader().setVisible(False)
-        self.tabela_calendario.setShowGrid(False)
-        self.tabela_calendario.setFocusPolicy(Qt.NoFocus)
-
-        header = self.tabela_calendario.horizontalHeader()
-        header.setSectionResizeMode(0, QHeaderView.Fixed)
-        header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(2, QHeaderView.Fixed)
-        header.setSectionResizeMode(3, QHeaderView.Fixed)
-
-        self.tabela_calendario.setColumnWidth(0, 55)
-        self.tabela_calendario.setColumnWidth(2, 95)
-        self.tabela_calendario.setColumnWidth(3, 120)
-
-        card_calendario.add(self.tabela_calendario)
-
-        self.lbl_calendario_resumo = QLabel("Pontuação: 0 pts | Posição: -")
-        self.lbl_calendario_resumo.setFont(Fontes.texto_normal())
-        self.lbl_calendario_resumo.setStyleSheet(
-            f"color: {Cores.TEXTO_PRIMARY}; border: none; background: transparent; font-weight: bold;"
-        )
-        card_calendario.add(self.lbl_calendario_resumo)
-
-        layout.addWidget(card_calendario)
-        layout.addStretch()
-
+        self._rw_construir_layout_weekend(layout)
+        self._rw_carregar_estado_persistido()
+        self._rw_atualizar_tela_weekend()
         return widget
+
+
+    def _rw_construir_layout_weekend(self, layout: QVBoxLayout) -> None:
+        topo = QFrame()
+        topo.setStyleSheet(
+            f"background-color: {Cores.FUNDO_CARD}; border: 1px solid {Cores.BORDA}; border-radius: 8px;"
+        )
+        topo_layout = QVBoxLayout(topo)
+        topo_layout.setContentsMargins(10, 8, 10, 8)
+        topo_layout.setSpacing(6)
+
+        nomes = ["Pre-Corrida", "Classificacao", "Corrida", "Resultado"]
+        linha = QHBoxLayout()
+        linha.setSpacing(6)
+        self._rw_etapas_labels = []
+        for indice, nome in enumerate(nomes):
+            lbl = QLabel(nome)
+            lbl.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+            self._rw_etapas_labels.append(lbl)
+            linha.addWidget(lbl)
+            if indice < len(nomes) - 1:
+                seta = QLabel("->")
+                seta.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+                linha.addWidget(seta)
+        linha.addStretch(1)
+        topo_layout.addLayout(linha)
+
+        self._rw_progress = QProgressBar()
+        self._rw_progress.setRange(0, 100)
+        self._rw_progress.setValue(25)
+        self._rw_progress.setTextVisible(True)
+        self._rw_progress.setFormat("%p%")
+        topo_layout.addWidget(self._rw_progress)
+        layout.addWidget(topo)
+
+        self._rw_stack = QStackedWidget()
+        layout.addWidget(self._rw_stack, 1)
+
+        pagina_pre = QWidget()
+        pre_layout = QVBoxLayout(pagina_pre)
+        pre_layout.setContentsMargins(0, 0, 0, 0)
+        pre_layout.setSpacing(8)
+        self.lbl_rw_pre_titulo = QLabel("RACE WEEKEND")
+        self.lbl_rw_pre_titulo.setFont(Fontes.titulo_medio())
+        self.lbl_rw_pre_subtitulo = QLabel("-")
+        self.txt_rw_pre_briefing = QTextEdit()
+        self.txt_rw_pre_briefing.setReadOnly(True)
+        self.btn_ver_modificadores = BotaoSecondary("Ver Modificadores dos IAs")
+        self.btn_ver_modificadores.clicked.connect(self._abrir_dialog_modificadores)
+        self.btn_rw_pre_para_quali = BotaoPrimary("Prosseguir -> Quali")
+        self.btn_rw_pre_para_quali.clicked.connect(lambda: self._rw_ir_para_etapa(1))
+        botoes_pre = QHBoxLayout()
+        botoes_pre.addStretch(1)
+        botoes_pre.addWidget(self.btn_ver_modificadores)
+        botoes_pre.addWidget(self.btn_rw_pre_para_quali)
+        pre_layout.addWidget(self.lbl_rw_pre_titulo)
+        pre_layout.addWidget(self.lbl_rw_pre_subtitulo)
+        pre_layout.addWidget(self.txt_rw_pre_briefing, 1)
+        pre_layout.addLayout(botoes_pre)
+        self._rw_stack.addWidget(pagina_pre)
+
+        pagina_quali = QWidget()
+        quali_layout = QVBoxLayout(pagina_quali)
+        quali_layout.setContentsMargins(0, 0, 0, 0)
+        quali_layout.setSpacing(8)
+        self.lbl_rw_quali_titulo = QLabel("CLASSIFICACAO")
+        self.lbl_rw_quali_titulo.setFont(Fontes.titulo_medio())
+        self.btn_rw_simular_quali = BotaoSuccess("Simular Classificacao")
+        self.btn_rw_simular_quali.clicked.connect(self._rw_simular_quali)
+        self.tbl_rw_quali = QTableWidget()
+        self.tbl_rw_quali.setColumnCount(4)
+        self.tbl_rw_quali.setHorizontalHeaderLabels(["Pos", "Piloto", "Equipe", "Score"])
+        self.tbl_rw_quali.setStyleSheet(Estilos.tabela())
+        self.tbl_rw_quali.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tbl_rw_quali.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tbl_rw_quali.verticalHeader().setVisible(False)
+        self.tbl_rw_quali.setShowGrid(False)
+        head = self.tbl_rw_quali.horizontalHeader()
+        head.setSectionResizeMode(0, QHeaderView.Fixed)
+        head.setSectionResizeMode(1, QHeaderView.Stretch)
+        head.setSectionResizeMode(2, QHeaderView.Stretch)
+        head.setSectionResizeMode(3, QHeaderView.Fixed)
+        self.tbl_rw_quali.setColumnWidth(0, 68)
+        self.tbl_rw_quali.setColumnWidth(3, 98)
+        self.lbl_rw_quali_contexto = QLabel("Simule a classificacao para montar o grid.")
+        botoes_quali = QHBoxLayout()
+        self.btn_rw_quali_voltar = BotaoSecondary("<- Voltar")
+        self.btn_rw_quali_voltar.clicked.connect(lambda: self._rw_ir_para_etapa(0))
+        self.btn_rw_quali_para_corrida = BotaoPrimary("Prosseguir -> Corrida")
+        self.btn_rw_quali_para_corrida.clicked.connect(lambda: self._rw_ir_para_etapa(2))
+        self.btn_rw_quali_para_corrida.setVisible(False)
+        botoes_quali.addWidget(self.btn_rw_quali_voltar)
+        botoes_quali.addStretch(1)
+        botoes_quali.addWidget(self.btn_rw_quali_para_corrida)
+        quali_layout.addWidget(self.lbl_rw_quali_titulo)
+        quali_layout.addWidget(self.btn_rw_simular_quali, 0, Qt.AlignLeft)
+        quali_layout.addWidget(self.tbl_rw_quali, 1)
+        quali_layout.addWidget(self.lbl_rw_quali_contexto)
+        quali_layout.addLayout(botoes_quali)
+        self._rw_stack.addWidget(pagina_quali)
+
+        pagina_corrida = QWidget()
+        corrida_layout = QVBoxLayout(pagina_corrida)
+        corrida_layout.setContentsMargins(0, 0, 0, 0)
+        corrida_layout.setSpacing(8)
+        self.lbl_rw_corrida_titulo = QLabel("CORRIDA")
+        self.lbl_rw_corrida_titulo.setFont(Fontes.titulo_medio())
+        self.lbl_rw_corrida_contexto = QLabel("-")
+        self.btn_rw_exportar_roster = BotaoSecondary("Exportar AI Season")
+        self.btn_rw_exportar_roster.clicked.connect(self._rw_exportar_roster)
+        self.lbl_rw_export_status = QLabel("AI Season + Roster ainda nao exportados.")
+        self.input_rw_posicao = QLineEdit()
+        self.input_rw_posicao.setPlaceholderText("Posicao final")
+        self.btn_rw_registrar_posicao = BotaoSuccess("Registrar Resultado")
+        self.btn_rw_registrar_posicao.clicked.connect(self._rw_registrar_resultado_manual)
+        self.btn_rw_simular_corrida = BotaoPrimary("Simular Corrida")
+        self.btn_rw_simular_corrida.clicked.connect(self._simular_corrida)
+        self.btn_rw_corrida_voltar = BotaoSecondary("<- Voltar")
+        self.btn_rw_corrida_voltar.clicked.connect(lambda: self._rw_ir_para_etapa(1))
+        corrida_layout.addWidget(self.lbl_rw_corrida_titulo)
+        corrida_layout.addWidget(self.lbl_rw_corrida_contexto)
+        corrida_layout.addWidget(self.btn_rw_exportar_roster, 0, Qt.AlignLeft)
+        corrida_layout.addWidget(self.lbl_rw_export_status)
+        corrida_layout.addWidget(self.input_rw_posicao, 0, Qt.AlignLeft)
+        corrida_layout.addWidget(self.btn_rw_registrar_posicao, 0, Qt.AlignLeft)
+        corrida_layout.addWidget(QLabel("OU"), 0, Qt.AlignCenter)
+        corrida_layout.addWidget(self.btn_rw_simular_corrida, 0, Qt.AlignLeft)
+        corrida_layout.addStretch(1)
+        corrida_layout.addWidget(self.btn_rw_corrida_voltar, 0, Qt.AlignLeft)
+        self._rw_stack.addWidget(pagina_corrida)
+
+        pagina_pos = QWidget()
+        pos_layout = QVBoxLayout(pagina_pos)
+        pos_layout.setContentsMargins(0, 0, 0, 0)
+        pos_layout.setSpacing(8)
+        self.lbl_rw_pos_titulo = QLabel("RESULTADO")
+        self.lbl_rw_pos_titulo.setFont(Fontes.titulo_medio())
+        self.txt_rw_pos = QTextEdit()
+        self.txt_rw_pos.setReadOnly(True)
+        self.btn_rw_proxima_rodada = BotaoPrimary("Proxima Rodada ->")
+        self.btn_rw_proxima_rodada.clicked.connect(self._rw_proxima_rodada)
+        pos_layout.addWidget(self.lbl_rw_pos_titulo)
+        pos_layout.addWidget(self.txt_rw_pos, 1)
+        pos_layout.addWidget(self.btn_rw_proxima_rodada, 0, Qt.AlignRight)
+        self._rw_stack.addWidget(pagina_pos)
+
+    def _rw_carregar_estado_persistido(self) -> None:
+        self._rw_etapa_atual = 0
+        self._rw_quali_resultado = []
+        self._rw_roster_exportado = False
+        self._rw_resultado_dialogo = {}
+
+        estado = self.banco.get("race_weekend")
+        if not isinstance(estado, dict):
+            return
+
+        try:
+            rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_atual = 1
+        try:
+            rodada_salva = int(estado.get("rodada", rodada_atual) or rodada_atual)
+        except (TypeError, ValueError):
+            rodada_salva = rodada_atual
+        try:
+            rodada_resultado = int(estado.get("rodada_resultado", rodada_salva) or rodada_salva)
+        except (TypeError, ValueError):
+            rodada_resultado = rodada_salva
+        try:
+            etapa = int(estado.get("etapa", 0) or 0)
+        except (TypeError, ValueError):
+            etapa = 0
+        etapa = max(0, min(3, etapa))
+
+        categoria_salva = str(estado.get("categoria_id", self.categoria_atual) or self.categoria_atual).strip()
+        mesma_categoria = categoria_salva == str(self.categoria_atual or "").strip()
+        mesmo_weekend = rodada_salva == rodada_atual
+        restaurar_pos = etapa == 3 and rodada_resultado == max(1, rodada_atual - 1)
+
+        if not mesma_categoria or (not mesmo_weekend and not restaurar_pos):
+            return
+
+        quali = estado.get("quali_resultado")
+        if isinstance(quali, list):
+            self._rw_quali_resultado = [item for item in quali if isinstance(item, dict)]
+        self._rw_roster_exportado = bool(estado.get("roster_exportado", False))
+        resultado_dialogo = estado.get("resultado_dialogo")
+        if isinstance(resultado_dialogo, dict):
+            self._rw_resultado_dialogo = dict(resultado_dialogo)
+        self._rw_etapa_atual = etapa
+
+    def _rw_salvar_estado_persistido(self) -> None:
+        try:
+            rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_atual = 1
+
+        rodada_resultado = rodada_atual
+        if isinstance(self._rw_resultado_dialogo, dict):
+            try:
+                rodada_resultado = int(
+                    self._rw_resultado_dialogo.get(
+                        "rodada_resultado",
+                        self._rw_resultado_dialogo.get("rodada", rodada_resultado),
+                    )
+                    or rodada_resultado
+                )
+            except (TypeError, ValueError):
+                rodada_resultado = rodada_atual
+
+        self.banco["race_weekend"] = {
+            "categoria_id": str(self.categoria_atual or ""),
+            "rodada": rodada_resultado if self._rw_etapa_atual == 3 else rodada_atual,
+            "rodada_resultado": rodada_resultado,
+            "etapa": int(max(0, min(3, self._rw_etapa_atual))),
+            "quali_resultado": [item for item in self._rw_quali_resultado if isinstance(item, dict)],
+            "roster_exportado": bool(self._rw_roster_exportado),
+            "resultado_dialogo": dict(self._rw_resultado_dialogo) if isinstance(self._rw_resultado_dialogo, dict) else {},
+        }
+        salvar_banco(self.banco)
+
+    def _rw_ir_para_etapa(self, etapa: int) -> None:
+        self._rw_etapa_atual = max(0, min(3, int(etapa)))
+        self._rw_salvar_estado_persistido()
+        self._rw_atualizar_tela_weekend()
+
+    def _rw_atualizar_barra_progresso(self) -> None:
+        labels = getattr(self, "_rw_etapas_labels", [])
+        for indice, lbl in enumerate(labels):
+            if indice < self._rw_etapa_atual:
+                lbl.setStyleSheet(f"color: {Cores.VERDE}; border: none; font-weight: 700;")
+            elif indice == self._rw_etapa_atual:
+                lbl.setStyleSheet(f"color: {Cores.ACCENT_PRIMARY}; border: none; font-weight: 700;")
+            else:
+                lbl.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+
+        if hasattr(self, "_rw_progress"):
+            porcentagem = int(((self._rw_etapa_atual + 1) / 4.0) * 100.0)
+            self._rw_progress.setValue(max(0, min(100, porcentagem)))
+
+    def _rw_obter_equipe_por_id(self, equipe_id: Any) -> dict[str, Any] | None:
+        for equipe in self.banco.get("equipes", []):
+            if not isinstance(equipe, dict):
+                continue
+            if self._ids_equivalentes_resultado(equipe.get("id"), equipe_id):
+                return equipe
+        return None
+
+    def _obter_expectativa_e_avaliacao(
+        self,
+        *,
+        persistir_historico: bool = False,
+        rodada_ref: int | None = None,
+    ) -> tuple[dict[str, Any], dict[str, Any]] | tuple[None, None]:
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            return None, None
+
+        equipe = obter_equipe_piloto(self.banco, jogador) or self._rw_obter_equipe_por_id(jogador.get("equipe_id"))
+        expectativa = calcular_expectativa_equipe(jogador, equipe, self.banco)
+        avaliacao = avaliar_desempenho_vs_expectativa(jogador, expectativa, self.banco)
+
+        if persistir_historico:
+            try:
+                rodada = int(rodada_ref if rodada_ref is not None else self.banco.get("rodada_atual", 1) or 1)
+            except (TypeError, ValueError):
+                rodada = 1
+            registrar_avaliacao_historico(
+                self.banco,
+                rodada=max(1, rodada),
+                categoria_id=str(jogador.get("categoria_atual", self.categoria_atual) or self.categoria_atual),
+                avaliacao=avaliacao,
+            )
+        return expectativa, avaliacao
+
+    def _rw_obter_alerta_contratual_visual(self, avaliacao: dict[str, Any] | None = None) -> dict[str, Any] | None:
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            return None
+        try:
+            rodada = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada = 1
+        total = max(1, self._obter_total_rodadas_temporada())
+        return gerar_alerta_contratual(
+            jogador,
+            self.banco,
+            rodada,
+            total,
+            avaliacao=avaliacao,
+            ignorar_cadencia=True,
+        )
+
+    def _processar_alerta_contratual_pos_corrida(
+        self,
+        rodada_processada: int,
+        avaliacao: dict[str, Any] | None = None,
+    ) -> dict[str, Any] | None:
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            return None
+
+        total = max(1, self._obter_total_rodadas_temporada())
+        alerta = gerar_alerta_contratual(
+            jogador,
+            self.banco,
+            max(1, int(rodada_processada)),
+            total,
+            avaliacao=avaliacao,
+            ignorar_cadencia=False,
+        )
+        if not isinstance(alerta, dict):
+            return None
+
+        registrar_alerta_contratual(
+            self.banco,
+            rodada_atual=max(1, int(rodada_processada)),
+            categoria_id=str(self.categoria_atual or ""),
+            alerta=alerta,
+        )
+
+        try:
+            gerador = self._obter_gerador_noticias()
+            temporada = int(self.banco.get("ano_atual", 2024) or 2024)
+            categoria_id = str(self.categoria_atual or "")
+            categoria_nome = obter_nome_categoria(categoria_id)
+            titulo = str(alerta.get("titulo", "Contrato") or "Contrato")
+            texto = str(alerta.get("texto", "") or "").strip()
+            detalhe = str(alerta.get("detalhe", "") or "").strip()
+            mensagem = texto if not detalhe else f"{texto} {detalhe}"
+            chave = f"contrato:{temporada}:{categoria_id}:{rodada_processada}:{titulo.casefold()}"
+            gerador.adicionar(
+                tipo="mercado",
+                icone=str(alerta.get("icone", "")),
+                titulo=f"Contrato - {titulo}",
+                texto=mensagem or "Atualizacao contratual.",
+                rodada=max(1, int(rodada_processada)),
+                temporada=temporada,
+                categoria_id=categoria_id,
+                categoria_nome=categoria_nome,
+                chave=chave,
+            )
+        except Exception:
+            pass
+
+        return alerta
+
+    def _rw_montar_briefing_pre_corrida(
+        self,
+        corrida: dict[str, Any] | None,
+    ) -> str:
+        if not isinstance(corrida, dict):
+            return "Temporada concluida. Finalize a temporada para iniciar o proximo ciclo."
+
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            return "Jogador nao encontrado."
+
+        categoria = str(jogador.get("categoria_atual", self.categoria_atual) or self.categoria_atual)
+        pilotos_categoria = [
+            p
+            for p in self.banco.get("pilotos", [])
+            if isinstance(p, dict)
+            and str(p.get("categoria_atual", "") or "").strip() == categoria
+            and not bool(p.get("aposentado", False))
+            and str(p.get("status", "ativo") or "ativo").strip().lower() not in {"aposentado", "livre", "reserva"}
+        ]
+
+        nome_circuito = str(corrida.get("circuito", corrida.get("nome", "Circuito")) or "Circuito")
+        briefing = BRIEFINGS_CIRCUITO.get(nome_circuito, BRIEFINGS_CIRCUITO.get("_default", "Circuito desafiador."))
+        clima = str(corrida.get("clima", "Seco") or "Seco")
+
+        fator_chuva = int(jogador.get("fator_chuva", 50) or 50)
+        historico_circuitos = jogador.get("historico_circuitos", {})
+        if not isinstance(historico_circuitos, dict):
+            historico_circuitos = {}
+        track_id_raw = corrida.get("trackId", corrida.get("id", ""))
+        track_id = str(track_id_raw or "")
+
+        entrada_historico = None
+        if track_id:
+            chaves_busca: list[Any] = [track_id]
+            try:
+                track_id_int = int(float(track_id_raw))
+            except (TypeError, ValueError):
+                track_id_int = None
+            if track_id_int is not None:
+                chaves_busca.extend([track_id_int, str(track_id_int)])
+
+            for chave in chaves_busca:
+                if chave in historico_circuitos:
+                    entrada_historico = historico_circuitos.get(chave)
+                    break
+
+        def _int_seguro_local(valor: Any, padrao: int = 0) -> int:
+            try:
+                return int(float(valor))
+            except (TypeError, ValueError):
+                return padrao
+
+        if isinstance(entrada_historico, dict):
+            vezes_no_circuito = _int_seguro_local(
+                entrada_historico.get(
+                    "corridas",
+                    entrada_historico.get(
+                        "vezes",
+                        entrada_historico.get("participacoes", entrada_historico.get("times", 0)),
+                    ),
+                ),
+                0,
+            )
+        else:
+            vezes_no_circuito = _int_seguro_local(entrada_historico, 0)
+        vezes_no_circuito = max(0, vezes_no_circuito)
+        corridas_na_cat = int(jogador.get("corridas_na_categoria", 0) or 0)
+
+        def _score_favorito(piloto: dict[str, Any]) -> int:
+            equipe = self._rw_obter_equipe_por_id(piloto.get("equipe_id")) or {}
+            try:
+                skill = int(float(piloto.get("skill", 0) or 0))
+            except (TypeError, ValueError):
+                skill = 0
+            try:
+                car_perf = int(float(equipe.get("car_performance", 50) or 50))
+            except (TypeError, ValueError):
+                car_perf = 50
+            return skill + car_perf
+
+        favorito = max(pilotos_categoria, key=_score_favorito) if pilotos_categoria else None
+
+        rival = None
+        rivalidades = jogador.get("rivalidades", [])
+        rival_ids: list[Any] = []
+        if isinstance(rivalidades, list):
+            for item in rivalidades:
+                rival_id = item.get("piloto_id", item.get("id")) if isinstance(item, dict) else item
+                if rival_id not in (None, ""):
+                    rival_ids.append(rival_id)
+        if rival_ids:
+            for piloto in pilotos_categoria:
+                if any(self._ids_equivalentes_resultado(piloto.get("id"), rid) for rid in rival_ids):
+                    rival = piloto
+                    break
+
+        equipe_id_jogador = jogador.get("equipe_id")
+        companheiro = next(
+            (
+                piloto
+                for piloto in pilotos_categoria
+                if not self._ids_equivalentes_resultado(piloto.get("id"), jogador.get("id"))
+                and self._ids_equivalentes_resultado(piloto.get("equipe_id"), equipe_id_jogador)
+            ),
+            None,
+        )
+
+        classificacao = obter_classificacao_categoria(self.banco, categoria)
+        posicao_jogador = next(
+            (
+                int(item.get("posicao", 0) or 0)
+                for item in classificacao
+                if isinstance(item, dict) and self._ids_equivalentes_resultado(item.get("piloto_id"), jogador.get("id"))
+            ),
+            0,
+        )
+        pontos_jogador = int(jogador.get("pontos_temporada", 0) or 0)
+        pontos_lider = int(classificacao[0].get("pontos", 0) or 0) if classificacao else 0
+        diferenca = max(0, pontos_lider - pontos_jogador)
+        try:
+            rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_atual = 1
+        total_rodadas = max(1, self._obter_total_rodadas_temporada())
+        corridas_restantes = max(0, total_rodadas - rodada_atual)
+        pontos_maximos_restantes = corridas_restantes * 25
+        if diferenca <= 0:
+            situacao_titulo = "Lider no campeonato."
+        elif diferenca <= pontos_maximos_restantes * 0.3:
+            situacao_titulo = "Titulo ao alcance."
+        elif diferenca <= pontos_maximos_restantes * 0.6:
+            situacao_titulo = "Titulo dificil, mas possivel."
+        elif diferenca <= pontos_maximos_restantes:
+            situacao_titulo = "Titulo muito dificil."
+        else:
+            situacao_titulo = "Matematicamente eliminado."
+
+        expectativa, avaliacao = self._obter_expectativa_e_avaliacao()
+        alerta_contrato = self._rw_obter_alerta_contratual_visual(avaliacao=avaliacao)
+
+        linhas = [
+            "-- BRIEFING DO CIRCUITO --",
+            briefing,
+            f"Clima previsto: {clima}",
+            "",
+            "-- ALERTAS DO JOGADOR --",
+            f"Fator de chuva: {fator_chuva}/100",
+            (
+                "Primeira vez neste circuito: atencao a penalidade de adaptacao."
+                if vezes_no_circuito <= 0
+                else f"Experiencia no circuito: {vezes_no_circuito} corrida(s)."
+            ),
+            (
+                f"Categoria ainda em adaptacao ({corridas_na_cat} corrida(s))."
+                if corridas_na_cat < 5
+                else f"Experiencia na categoria: {corridas_na_cat} corrida(s)."
+            ),
+            "",
+            "-- DESTAQUES DO GRID --",
+        ]
+        if isinstance(favorito, dict):
+            equipe_fav = self._rw_obter_equipe_por_id(favorito.get("equipe_id")) or {}
+            linhas.append(
+                f"Favorito: {favorito.get('nome', 'Piloto')} (skill {int(favorito.get('skill', 0) or 0)}, carro {int(equipe_fav.get('car_performance', 50) or 50)})"
+            )
+        if isinstance(rival, dict):
+            linhas.append(f"Rival no grid: {rival.get('nome', 'Rival')}.")
+        if isinstance(companheiro, dict):
+            linhas.append(f"Companheiro no grid: {companheiro.get('nome', 'Companheiro')}.")
+        linhas.extend(
+            [
+                "",
+                "-- CONTEXTO DO CAMPEONATO --",
+                (f"Sua posicao: {posicao_jogador}o ({pontos_jogador} pts)" if posicao_jogador > 0 else "Sua posicao: sem dados"),
+                f"Lider: {pontos_lider} pts | Diferenca: -{diferenca} pts",
+                f"Restam {corridas_restantes} corrida(s) | Maximo possivel: {pontos_maximos_restantes} pts",
+                f"Situacao do titulo: {situacao_titulo}",
+            ]
+        )
+        if isinstance(expectativa, dict) and isinstance(avaliacao, dict):
+            linhas.extend(
+                [
+                    "",
+                    "-- EXPECTATIVAS DA EQUIPE --",
+                    f"Equipe espera: {expectativa.get('texto_faixa', 'Top')}.",
+                    f"Atual: {int(avaliacao.get('posicao_real', 0) or 0)}o - {avaliacao.get('emoji', '')} {avaliacao.get('texto', '')}",
+                    f"Impacto: {avaliacao.get('impacto', '')}",
+                ]
+            )
+        if isinstance(alerta_contrato, dict):
+            linhas.extend(
+                [
+                    "",
+                    "-- TENSAO CONTRATUAL --",
+                    str(alerta_contrato.get("titulo", "Contrato")),
+                    str(alerta_contrato.get("texto", "")),
+                    str(alerta_contrato.get("detalhe", "")),
+                ]
+            )
+        return "\n".join(item for item in linhas if item is not None)
+
+    def _rw_atualizar_pre_corrida(self, corrida: dict[str, Any] | None) -> None:
+        if not hasattr(self, "lbl_rw_pre_titulo"):
+            return
+        if not isinstance(corrida, dict):
+            self.lbl_rw_pre_titulo.setText("RACE WEEKEND")
+            self.lbl_rw_pre_subtitulo.setText("Temporada concluida")
+            self.txt_rw_pre_briefing.setText("Nao ha corrida pendente.")
+            self.btn_rw_pre_para_quali.setEnabled(False)
+            return
+
+        try:
+            rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
+        except (TypeError, ValueError):
+            rodada_atual = 1
+        total = max(1, self._obter_total_rodadas_temporada())
+        circuito = str(corrida.get("circuito", corrida.get("nome", "Circuito")) or "Circuito")
+        clima = str(corrida.get("clima", "Seco") or "Seco")
+        self.lbl_rw_pre_titulo.setText(f"RACE WEEKEND - Rodada {min(max(rodada_atual, 1), total)}/{total}")
+        self.lbl_rw_pre_subtitulo.setText(f"{circuito} | {clima}")
+        self.txt_rw_pre_briefing.setText(self._rw_montar_briefing_pre_corrida(corrida))
+        self.btn_rw_pre_para_quali.setEnabled(True)
+
+    def _rw_atualizar_quali(self) -> None:
+        if not hasattr(self, "tbl_rw_quali"):
+            return
+        tabela = self.tbl_rw_quali
+        tabela.clearContents()
+        grid = [item for item in self._rw_quali_resultado if isinstance(item, dict)]
+        tabela.setRowCount(len(grid) if grid else 1)
+
+        if not grid:
+            for col in range(4):
+                texto = "Simule a classificacao para gerar o grid." if col == 1 else "-"
+                item = self._criar_item_tabela(texto, Cores.TEXTO_MUTED, Cores.FUNDO_CARD)
+                item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter if col == 1 else Qt.AlignCenter)
+                tabela.setItem(0, col, item)
+            self.btn_rw_quali_para_corrida.setVisible(False)
+            self.lbl_rw_quali_contexto.setText("Seu companheiro e rival aparecerao apos a simulacao.")
+            return
+
+        jogador = self._obter_jogador()
+        jogador_id = jogador.get("id") if isinstance(jogador, dict) else None
+        equipe_id_jogador = jogador.get("equipe_id") if isinstance(jogador, dict) else None
+        rival_ids = []
+        rivalidades = jogador.get("rivalidades", []) if isinstance(jogador, dict) else []
+        if isinstance(rivalidades, list):
+            for item in rivalidades:
+                rival_id = item.get("piloto_id", item.get("id")) if isinstance(item, dict) else item
+                if rival_id not in (None, ""):
+                    rival_ids.append(rival_id)
+
+        pos_companheiro = "-"
+        pos_rival = "-"
+        for indice, entrada in enumerate(grid):
+            posicao = int(entrada.get("posicao_campeonato", entrada.get("posicao", indice + 1)) or (indice + 1))
+            piloto_id = entrada.get("piloto_id")
+            nome = str(entrada.get("piloto_nome", "Piloto") or "Piloto")
+            equipe = str(entrada.get("equipe_nome", "Equipe") or "Equipe")
+            score = float(entrada.get("quali_score", 0.0) or 0.0)
+
+            is_jogador = self._ids_equivalentes_resultado(piloto_id, jogador_id)
+            is_companheiro = (
+                not is_jogador
+                and equipe_id_jogador not in (None, "")
+                and self._ids_equivalentes_resultado(entrada.get("equipe_id"), equipe_id_jogador)
+            )
+            is_rival = any(self._ids_equivalentes_resultado(piloto_id, rid) for rid in rival_ids)
+            cor_fundo = Cores.FUNDO_CARD if indice % 2 == 0 else Cores.FUNDO_APP
+            if is_jogador:
+                cor_fundo = "#173b5f"
+                nome = f"[VOCE] {nome}"
+            elif is_companheiro:
+                cor_fundo = "#2a2f4f"
+                pos_companheiro = f"P{posicao}"
+            elif is_rival:
+                cor_fundo = "#4a2b2b"
+                pos_rival = f"P{posicao}"
+
+            tabela.setRowHeight(indice, 30)
+            tabela.setItem(indice, 0, self._criar_item_tabela(f"P{posicao}", Cores.TEXTO_PRIMARY, cor_fundo, Qt.AlignCenter))
+            tabela.setItem(indice, 1, self._criar_item_tabela(nome, Cores.TEXTO_PRIMARY, cor_fundo))
+            tabela.setItem(indice, 2, self._criar_item_tabela(equipe, Cores.TEXTO_SECONDARY, cor_fundo))
+            tabela.setItem(indice, 3, self._criar_item_tabela(f"{score:.2f}", Cores.ACCENT_PRIMARY, cor_fundo, Qt.AlignCenter))
+
+        partes = []
+        if pos_companheiro != "-":
+            partes.append(f"Companheiro: {pos_companheiro}")
+        if pos_rival != "-":
+            partes.append(f"Rival: {pos_rival}")
+        self.lbl_rw_quali_contexto.setText(" | ".join(partes) if partes else "Grid pronto para a largada.")
+        self.btn_rw_quali_para_corrida.setVisible(True)
+
+    def _rw_atualizar_corrida(self, corrida: dict[str, Any] | None) -> None:
+        if not hasattr(self, "lbl_rw_corrida_titulo"):
+            return
+        if not isinstance(corrida, dict):
+            self.lbl_rw_corrida_titulo.setText("CORRIDA")
+            self.lbl_rw_corrida_contexto.setText("Sem corrida pendente.")
+            return
+
+        circuito = str(corrida.get("circuito", corrida.get("nome", "Circuito")) or "Circuito")
+        clima = str(corrida.get("clima", "Seco") or "Seco")
+        grid = [item for item in self._rw_quali_resultado if isinstance(item, dict)]
+        jogador = self._obter_jogador()
+        jogador_id = jogador.get("id") if isinstance(jogador, dict) else None
+        pos_jogador_grid = next(
+            (
+                int(item.get("posicao_campeonato", item.get("posicao", 0)) or 0)
+                for item in grid
+                if self._ids_equivalentes_resultado(item.get("piloto_id"), jogador_id)
+            ),
+            0,
+        )
+        texto_largada = f"Voce larga de P{pos_jogador_grid}" if pos_jogador_grid > 0 else "Grid ainda nao definido"
+        self.lbl_rw_corrida_titulo.setText(f"CORRIDA - {circuito}")
+        self.lbl_rw_corrida_contexto.setText(
+            f"{texto_largada} | Grid: {len(grid) if grid else '-'} pilotos | Clima: {clima}"
+        )
+
+        if self._rw_roster_exportado:
+            self.lbl_rw_export_status.setStyleSheet(f"color: {Cores.VERDE}; border: none;")
+            self.lbl_rw_export_status.setText("AI Season + Roster exportados com sucesso.")
+        else:
+            self.lbl_rw_export_status.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+            self.lbl_rw_export_status.setText("AI Season + Roster ainda nao exportados.")
+
+    def _rw_atualizar_pos_corrida(self) -> None:
+        if not hasattr(self, "txt_rw_pos"):
+            return
+        if not isinstance(self._rw_resultado_dialogo, dict) or not self._rw_resultado_dialogo:
+            self.lbl_rw_pos_titulo.setText("RESULTADO")
+            self.txt_rw_pos.setText("Resultado sera exibido aqui apos concluir a corrida.")
+            self.btn_rw_proxima_rodada.setText("Proxima Rodada ->")
+            return
+
+        from UI.dialogs import montar_texto_resultado_corrida
+
+        titulo = str(self._rw_resultado_dialogo.get("titulo", "Resultado") or "Resultado")
+        self.lbl_rw_pos_titulo.setText(titulo)
+        self.txt_rw_pos.setText(montar_texto_resultado_corrida(self._rw_resultado_dialogo))
+        self.btn_rw_proxima_rodada.setText("Fim de Temporada ->" if self._temporada_concluida() else "Proxima Rodada ->")
+
+    def _rw_atualizar_tela_weekend(self) -> None:
+        if not hasattr(self, "_rw_stack"):
+            return
+        evento = self._get_proximo_evento_exibicao()
+        corrida = evento if isinstance(evento, dict) else self._get_corrida_atual()
+        self._rw_atualizar_barra_progresso()
+        self._rw_atualizar_pre_corrida(corrida)
+        self._rw_atualizar_quali()
+        self._rw_atualizar_corrida(corrida)
+        self._rw_atualizar_pos_corrida()
+        self._rw_stack.setCurrentIndex(max(0, min(3, self._rw_etapa_atual)))
+
+    def _rw_simular_quali(self) -> None:
+        grid = self._simular_classificacao(retornar_resultado=True)
+        if not isinstance(grid, list) or not grid:
+            return
+        self._rw_quali_resultado = [item for item in grid if isinstance(item, dict)]
+        self._rw_etapa_atual = max(1, self._rw_etapa_atual)
+        self._rw_salvar_estado_persistido()
+        self._rw_atualizar_tela_weekend()
+
+    def _rw_exportar_roster(self) -> None:
+        self._exportar_aiseason(silencioso=True)
+        self._rw_roster_exportado = False
+        obter_nome = getattr(self, "_obter_nome_roster_categoria", None)
+        obter_arquivo = getattr(self, "_obter_arquivo_roster_categoria", None)
+        obter_arquivo_season = getattr(self, "_obter_arquivo_season_evento_atual", None)
+        if callable(obter_nome) and callable(obter_arquivo):
+            try:
+                arquivo_roster = str(obter_arquivo(obter_nome()) or "").strip()
+                arquivo_season = (
+                    str(obter_arquivo_season() or "").strip()
+                    if callable(obter_arquivo_season)
+                    else ""
+                )
+                self._rw_roster_exportado = bool(
+                    arquivo_roster
+                    and os.path.isfile(arquivo_roster)
+                    and arquivo_season
+                    and os.path.isfile(arquivo_season)
+                )
+            except Exception:
+                self._rw_roster_exportado = False
+        self._rw_salvar_estado_persistido()
+        self._rw_atualizar_tela_weekend()
+
+    def _rw_ajustar_resultado_para_posicao_jogador(
+        self,
+        classificacao: list[dict[str, Any]],
+        posicao_alvo: int,
+    ) -> list[dict[str, Any]]:
+        resultado = [dict(item) for item in classificacao if isinstance(item, dict)]
+        if not resultado:
+            return []
+
+        jogador = self._obter_jogador()
+        jogador_id = jogador.get("id") if isinstance(jogador, dict) else None
+        indice_jogador = next(
+            (
+                indice
+                for indice, item in enumerate(resultado)
+                if self._ids_equivalentes_resultado(item.get("piloto_id"), jogador_id)
+                or bool(item.get("is_jogador", False))
+            ),
+            -1,
+        )
+        if indice_jogador < 0:
+            return resultado
+
+        entrada_jogador = resultado.pop(indice_jogador)
+        posicao_real = max(1, min(int(posicao_alvo), len(resultado) + 1))
+        resultado.insert(posicao_real - 1, entrada_jogador)
+
+        for indice, item in enumerate(resultado, start=1):
+            dnf = bool(item.get("dnf", False))
+            volta_rapida = bool(item.get("volta_rapida", False))
+            item["posicao"] = indice
+            item["posicao_geral"] = indice
+            item["posicao_classe"] = indice
+            item["posicao_campeonato"] = indice
+            item["pontos"] = self._calcular_pontos_da_posicao(
+                posicao=indice,
+                volta_rapida=volta_rapida,
+                dnf=dnf,
+            )
+        return resultado
+
+    def _rw_registrar_resultado_manual(self) -> None:
+        texto_pos = str(self.input_rw_posicao.text() if hasattr(self, "input_rw_posicao") else "").strip()
+        if not texto_pos:
+            QMessageBox.warning(self, "Aviso", "Informe sua posicao final para registrar o resultado.")
+            return
+        try:
+            posicao_final = int(texto_pos)
+        except (TypeError, ValueError):
+            QMessageBox.warning(self, "Aviso", "Posicao invalida. Use um numero inteiro.")
+            return
+        if posicao_final <= 0:
+            QMessageBox.warning(self, "Aviso", "A posicao deve ser maior que zero.")
+            return
+
+        corrida = self._get_corrida_atual()
+        if not isinstance(corrida, dict):
+            QMessageBox.warning(self, "Aviso", "Nao ha corrida disponivel para registrar resultado.")
+            return
+
+        try:
+            from Logica.simulacao import simular_corrida_categoria_detalhada
+
+            resultado_detalhado = simular_corrida_categoria_detalhada(self.banco, self.categoria_atual)
+            classificacao_base = resultado_detalhado.get("classificacao", []) if isinstance(resultado_detalhado, dict) else []
+            classificacao_base = [item for item in classificacao_base if isinstance(item, dict)]
+            if not classificacao_base:
+                QMessageBox.warning(self, "Aviso", "Nao foi possivel gerar classificacao base para registro manual.")
+                return
+
+            classificacao = self._rw_ajustar_resultado_para_posicao_jogador(classificacao_base, posicao_final)
+            pontos_antes = self._snapshot_pontos_categoria(self.categoria_atual)
+            lesoes_antes = self._snapshot_lesoes_categoria(self.categoria_atual)
+            ordens_antes = self._snapshot_ordens_hierarquia_categoria(self.categoria_atual)
+            rodada_processada = int(self.banco.get("rodada_atual", 1) or 1)
+
+            aplicados = self._aplicar_classificacao_por_id(
+                classificacao,
+                rodada=rodada_processada,
+                foi_corrida_jogador=True,
+            )
+            if aplicados <= 0:
+                QMessageBox.warning(self, "Aviso", "Nenhum resultado pode ser aplicado para o registro manual.")
+                return
+
+            calcular_pontos_equipes(self.banco, self.categoria_atual)
+            resumo_outras_categorias = self._simular_rodada_todas_categorias(
+                rodada_referencia=int(self.banco.get("rodada_atual", 1) or 1),
+            )
+            self._avancar_rodada()
+            self._atualizar_tudo()
+
+            outras_categorias = []
+            for categoria_id, info in (resumo_outras_categorias or {}).items():
+                if not isinstance(info, dict):
+                    continue
+                outras_categorias.append(
+                    {
+                        "categoria_id": categoria_id,
+                        "categoria_nome": obter_nome_categoria(str(categoria_id)),
+                        "rodada": int(info.get("rodada", 0) or 0),
+                        "vencedor": str(info.get("vencedor", "Sem vencedor") or "Sem vencedor"),
+                    }
+                )
+
+            self._abrir_resultado_corrida_detalhado(
+                classificacao=classificacao,
+                corrida=corrida,
+                categoria_id=self.categoria_atual,
+                rodada=rodada_processada,
+                pontos_antes=pontos_antes,
+                lesoes_antes=lesoes_antes,
+                ordens_antes=ordens_antes,
+                outras_categorias=outras_categorias,
+            )
+        except Exception as erro:
+            QMessageBox.critical(self, "Erro", f"Erro ao registrar resultado manual:\n{erro}")
+
+    def _rw_receber_resultado_dialogo(
+        self,
+        dados_dialogo: dict[str, Any],
+        *,
+        rodada_resultado: int | None = None,
+    ) -> bool:
+        if not isinstance(dados_dialogo, dict):
+            return False
+        payload = dict(dados_dialogo)
+        if rodada_resultado is not None:
+            payload["rodada_resultado"] = int(rodada_resultado)
+        self._rw_resultado_dialogo = payload
+        self._rw_etapa_atual = 3
+        self._rw_salvar_estado_persistido()
+        self._rw_atualizar_tela_weekend()
+        return True
+
+    def _rw_proxima_rodada(self) -> None:
+        if self._temporada_concluida():
+            self._finalizar_temporada()
+            return
+        self._rw_etapa_atual = 0
+        self._rw_quali_resultado = []
+        self._rw_roster_exportado = False
+        self._rw_resultado_dialogo = {}
+        if hasattr(self, "input_rw_posicao"):
+            self.input_rw_posicao.clear()
+        self._rw_salvar_estado_persistido()
+        self._rw_atualizar_tela_weekend()
 
     def _criar_grafico_equipes_dashboard(self) -> QWidget:
         wrapper = QWidget()
@@ -3179,7 +4121,6 @@ class TelaCarreira(
                     dados_por_equipe[eq_key].append((ano, pos, cor))
 
         # Adicionar posições atuais se a temporada ainda estiver rolando (ou usar da atual)
-        equipes_atuais = obter_equipes_categoria(self.banco, cat_id) if hasattr(self, 'banco') else []
         ano_atual = int(self.banco.get("ano_atual", 2024))
         for eq in self.equipes_ordenadas:
             eq_nome = str(eq.get("nome", "") or "").strip()
@@ -3363,9 +4304,187 @@ class TelaCarreira(
         card_equipe.add(self.info_pts_equipe)
         card_equipe.add(self.info_vit_equipe)
 
+        card_equipe.add(Separador())
+
+        lbl_comp = QLabel("COMPARACAO JOGADOR VS COMPANHEIRO")
+        lbl_comp.setFont(Fontes.label_campo())
+        lbl_comp.setStyleSheet(
+            f"color: {Cores.TEXTO_MUTED}; border: none; background: transparent;"
+        )
+        card_equipe.add(lbl_comp)
+
+        self.tabela_comparacao_dupla = QTableWidget()
+        self.tabela_comparacao_dupla.setColumnCount(3)
+        self.tabela_comparacao_dupla.setHorizontalHeaderLabels(["Stat", "Voce", "Companheiro"])
+        self.tabela_comparacao_dupla.setStyleSheet(Estilos.tabela())
+        self.tabela_comparacao_dupla.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tabela_comparacao_dupla.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tabela_comparacao_dupla.verticalHeader().setVisible(False)
+        self.tabela_comparacao_dupla.setShowGrid(False)
+        head_comp = self.tabela_comparacao_dupla.horizontalHeader()
+        head_comp.setSectionResizeMode(0, QHeaderView.Stretch)
+        head_comp.setSectionResizeMode(1, QHeaderView.Stretch)
+        head_comp.setSectionResizeMode(2, QHeaderView.Stretch)
+        card_equipe.add(self.tabela_comparacao_dupla)
+
+        self.lbl_comparacao_status = QLabel("Comparacao indisponivel.")
+        self.lbl_comparacao_status.setWordWrap(True)
+        self.lbl_comparacao_status.setFont(Fontes.texto_pequeno())
+        self.lbl_comparacao_status.setStyleSheet(
+            f"color: {Cores.TEXTO_SECONDARY}; border: none; background: transparent;"
+        )
+        card_equipe.add(self.lbl_comparacao_status)
+
+        card_equipe.add(Separador())
+        lbl_expect = QLabel("EXPECTATIVAS DA EQUIPE")
+        lbl_expect.setFont(Fontes.label_campo())
+        lbl_expect.setStyleSheet(
+            f"color: {Cores.TEXTO_MUTED}; border: none; background: transparent;"
+        )
+        card_equipe.add(lbl_expect)
+        self.lbl_expectativa_faixa = QLabel("Expectativa: -")
+        self.lbl_expectativa_faixa.setStyleSheet(f"color: {Cores.TEXTO_PRIMARY}; border: none;")
+        self.lbl_expectativa_status = QLabel("Avaliacao: -")
+        self.lbl_expectativa_status.setWordWrap(True)
+        self.lbl_expectativa_status.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        self.lbl_expectativa_impacto = QLabel("Impacto: -")
+        self.lbl_expectativa_impacto.setWordWrap(True)
+        self.lbl_expectativa_impacto.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        card_equipe.add(self.lbl_expectativa_faixa)
+        card_equipe.add(self.lbl_expectativa_status)
+        card_equipe.add(self.lbl_expectativa_impacto)
+
+        self.txt_historico_avaliacao = QTextEdit()
+        self.txt_historico_avaliacao.setReadOnly(True)
+        self.txt_historico_avaliacao.setMinimumHeight(100)
+        self.txt_historico_avaliacao.setStyleSheet(
+            f"""
+            QTextEdit {{
+                background: {Cores.FUNDO_CARD};
+                color: {Cores.TEXTO_SECONDARY};
+                border: 1px solid {Cores.BORDA};
+                border-radius: 6px;
+                padding: 6px;
+            }}
+            """
+        )
+        card_equipe.add(self.txt_historico_avaliacao)
+
         layout.addWidget(card_equipe)
         layout.addStretch()
 
+        return widget
+
+    def _build_tab_noticias(self):
+        widget = QWidget()
+        root_layout = QVBoxLayout(widget)
+        root_layout.setContentsMargins(15, 15, 15, 15)
+        root_layout.setSpacing(10)
+
+        topo = QHBoxLayout()
+        lbl_titulo = QLabel("FEED DE NOTICIAS")
+        lbl_titulo.setFont(Fontes.titulo_medio())
+        lbl_titulo.setStyleSheet(f"color: {Cores.TEXTO_PRIMARY}; border: none;")
+        topo.addWidget(lbl_titulo)
+        topo.addStretch(1)
+
+        self.combo_noticias_filtro = QComboBox()
+        self.combo_noticias_filtro.setObjectName("combo_categoria_top")
+        self.combo_noticias_filtro.setMinimumWidth(170)
+        self.combo_noticias_filtro.addItems(
+            [
+                "Todos",
+                "Corrida",
+                "Incidente",
+                "Mercado",
+                "Promocao",
+                "Rebaixamento",
+                "Aposentadoria",
+                "Rookies",
+                "Hierarquia",
+                "Milestone",
+            ]
+        )
+        self.combo_noticias_filtro.currentIndexChanged.connect(self._atualizar_feed_noticias)
+        topo.addWidget(self.combo_noticias_filtro)
+        root_layout.addLayout(topo)
+
+        scroll = QScrollArea()
+        scroll.setWidgetResizable(True)
+        scroll.setFrameShape(QFrame.NoFrame)
+        root_layout.addWidget(scroll, 1)
+
+        self._widget_noticias_scroll = QWidget()
+        self._layout_noticias_cards = QVBoxLayout(self._widget_noticias_scroll)
+        self._layout_noticias_cards.setContentsMargins(0, 0, 0, 0)
+        self._layout_noticias_cards.setSpacing(10)
+        scroll.setWidget(self._widget_noticias_scroll)
+        return widget
+
+    def _build_tab_outras_categorias(self):
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+
+        topo = QHBoxLayout()
+        lbl_titulo = QLabel("OUTRAS CATEGORIAS")
+        lbl_titulo.setFont(Fontes.titulo_medio())
+        lbl_titulo.setStyleSheet(f"color: {Cores.TEXTO_PRIMARY}; border: none;")
+        topo.addWidget(lbl_titulo)
+        topo.addStretch(1)
+
+        self.combo_outras_categorias = QComboBox()
+        self.combo_outras_categorias.setObjectName("combo_categoria_top")
+        self.combo_outras_categorias.setMinimumWidth(260)
+        self.combo_outras_categorias.currentIndexChanged.connect(self._atualizar_aba_outras_categorias)
+        topo.addWidget(self.combo_outras_categorias)
+        layout.addLayout(topo)
+
+        self.lbl_outras_contexto = QLabel("Selecione uma categoria para ver o resumo.")
+        self.lbl_outras_contexto.setWordWrap(True)
+        self.lbl_outras_contexto.setFont(Fontes.texto_normal())
+        self.lbl_outras_contexto.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+        layout.addWidget(self.lbl_outras_contexto)
+
+        self.tabela_outras_pilotos = QTableWidget()
+        self.tabela_outras_pilotos.setColumnCount(4)
+        self.tabela_outras_pilotos.setHorizontalHeaderLabels(["POS", "PILOTO", "EQUIPE", "PTS"])
+        self.tabela_outras_pilotos.setStyleSheet(Estilos.tabela())
+        self.tabela_outras_pilotos.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tabela_outras_pilotos.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tabela_outras_pilotos.verticalHeader().setVisible(False)
+        self.tabela_outras_pilotos.setShowGrid(False)
+        head_pil = self.tabela_outras_pilotos.horizontalHeader()
+        head_pil.setSectionResizeMode(0, QHeaderView.Fixed)
+        head_pil.setSectionResizeMode(1, QHeaderView.Stretch)
+        head_pil.setSectionResizeMode(2, QHeaderView.Stretch)
+        head_pil.setSectionResizeMode(3, QHeaderView.Fixed)
+        self.tabela_outras_pilotos.setColumnWidth(0, 58)
+        self.tabela_outras_pilotos.setColumnWidth(3, 90)
+        layout.addWidget(self.tabela_outras_pilotos, 1)
+
+        self.tabela_outras_equipes = QTableWidget()
+        self.tabela_outras_equipes.setColumnCount(3)
+        self.tabela_outras_equipes.setHorizontalHeaderLabels(["POS", "CONSTRUTOR", "PTS"])
+        self.tabela_outras_equipes.setStyleSheet(Estilos.tabela())
+        self.tabela_outras_equipes.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.tabela_outras_equipes.setSelectionMode(QAbstractItemView.NoSelection)
+        self.tabela_outras_equipes.verticalHeader().setVisible(False)
+        self.tabela_outras_equipes.setShowGrid(False)
+        head_eq = self.tabela_outras_equipes.horizontalHeader()
+        head_eq.setSectionResizeMode(0, QHeaderView.Fixed)
+        head_eq.setSectionResizeMode(1, QHeaderView.Stretch)
+        head_eq.setSectionResizeMode(2, QHeaderView.Fixed)
+        self.tabela_outras_equipes.setColumnWidth(0, 58)
+        self.tabela_outras_equipes.setColumnWidth(2, 90)
+        layout.addWidget(self.tabela_outras_equipes, 1)
+
+        self.lbl_outras_ultimo_resultado = QLabel("Ultimo resultado: sem dados.")
+        self.lbl_outras_ultimo_resultado.setWordWrap(True)
+        self.lbl_outras_ultimo_resultado.setFont(Fontes.texto_pequeno())
+        self.lbl_outras_ultimo_resultado.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+        layout.addWidget(self.lbl_outras_ultimo_resultado)
         return widget
 
     def _estilo_barra_previsao(self, cor: str) -> str:
@@ -3479,7 +4598,7 @@ class TelaCarreira(
         scroll.setWidgetResizable(True)
         scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll.setStyleSheet(
-            f"""
+            """
             QScrollArea {{
                 border: none;
                 background-color: transparent;
@@ -4033,48 +5152,6 @@ class TelaCarreira(
 
         self.layout_bandeiras_corridas.addStretch(1)
         self.layout_resultados_corridas.addStretch(1)
-
-    def _formatar_resultado_calendario(self, resultado: Any) -> tuple[str, str]:
-        if resultado in (None, "", "—", "-"):
-            return "—", Cores.TEXTO_MUTED
-
-        texto = str(resultado).strip()
-        if texto.upper() == "DNF":
-            return "DNF (+0)", Cores.VERMELHO
-
-        try:
-            posicao = int(texto)
-        except (TypeError, ValueError):
-            return "—", Cores.TEXTO_MUTED
-
-        pontos = self._calcular_pontos_da_posicao(posicao=posicao)
-        if posicao == 1:
-            cor = Cores.OURO
-        elif posicao == 2:
-            cor = Cores.PRATA
-        elif posicao == 3:
-            cor = Cores.BRONZE
-        elif 4 <= posicao <= 10:
-            cor = Cores.VERDE
-        else:
-            cor = Cores.TEXTO_SECONDARY
-
-        return f"P{posicao} (+{pontos})", cor
-
-    def _status_rodada_calendario(
-        self,
-        indice_rodada: int,
-        corridas_disputadas: int,
-        temporada_concluida: bool,
-    ) -> tuple[str, str]:
-        if indice_rodada < corridas_disputadas:
-            return "✅ Feito", Cores.VERDE
-
-        if not temporada_concluida and indice_rodada == corridas_disputadas:
-            return "🔜 Próx", Cores.AMARELO
-
-        return "⏳ Pendente", Cores.TEXTO_SECONDARY
-
     def _simular_previsao_com_vitorias(
         self,
         pilotos_base: list[dict[str, Any]],
@@ -4321,8 +5398,39 @@ class TelaCarreira(
             item.setFont(fonte)
         return item
 
-    def _simular_classificacao(self):
-        return self._delegar_mixin(SimularMixin, "_simular_classificacao")
+    def _simular_classificacao(self, *, retornar_resultado: bool = False):
+        return self._delegar_mixin(
+            SimularMixin,
+            "_simular_classificacao",
+            retornar_resultado=retornar_resultado,
+        )
+
+    def _abrir_dialog_modificadores(self) -> None:
+        dados = self.banco.get("modifier_preview")
+        if not isinstance(dados, dict):
+            QMessageBox.information(
+                self,
+                "Modificadores",
+                "Nenhum preview de modificadores disponivel ainda. Exporte o roster da proxima corrida primeiro.",
+            )
+            return
+
+        pilotos = dados.get("pilotos", [])
+        if not isinstance(pilotos, list) or not pilotos:
+            QMessageBox.information(
+                self,
+                "Modificadores",
+                "Nenhum modificador registrado para a rodada atual.",
+            )
+            return
+
+        try:
+            from UI.dialogs import ModificadoresDialog
+
+            dialogo = ModificadoresDialog(dados=dados, parent=self)
+            dialogo.exec()
+        except Exception as erro:
+            QMessageBox.warning(self, "Aviso", f"Tela de modificadores indisponivel.\nErro: {erro}")
 
     # ============================================================
     # ATUALIZAÇÕES
@@ -4336,13 +5444,276 @@ class TelaCarreira(
         self._atualizar_tabela_equipes()
         self._atualizar_stats_jogador()
         self._atualizar_proxima_corrida()
-        self._atualizar_calendario_visual()
         self._atualizar_minha_equipe()
         self._atualizar_previsao_campeonato()
         self._atualizar_aba_mercado()
+        self._atualizar_feed_noticias()
+        self._atualizar_aba_outras_categorias()
 
         if animar and getattr(self, "_ux_initialized", False):
             QTimer.singleShot(100, self._animar_entrada_dashboard)
+
+    def _atualizar_feed_noticias(self, *_args) -> None:
+        if not hasattr(self, "_layout_noticias_cards"):
+            return
+
+        while self._layout_noticias_cards.count():
+            item = self._layout_noticias_cards.takeAt(0)
+            widget = item.widget()
+            if widget is not None:
+                widget.deleteLater()
+
+        filtro_tipo = ""
+        if hasattr(self, "combo_noticias_filtro"):
+            filtro_texto = str(self.combo_noticias_filtro.currentText() or "").strip().lower()
+            mapa_tipos = {
+                "corrida": "corrida",
+                "incidente": "incidente",
+                "mercado": "mercado",
+                "promocao": "promocao",
+                "rebaixamento": "rebaixamento",
+                "aposentadoria": "aposentadoria",
+                "rookies": "rookies",
+                "hierarquia": "hierarquia",
+                "milestone": "milestone",
+            }
+            filtro_tipo = mapa_tipos.get(filtro_texto, "")
+
+        noticias = listar_noticias_ordenadas(self.banco, tipo=filtro_tipo, limite=120)
+        if not noticias:
+            vazio = QLabel("Nenhuma noticia disponivel para o filtro atual.")
+            vazio.setWordWrap(True)
+            vazio.setFont(Fontes.texto_normal())
+            vazio.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+            self._layout_noticias_cards.addWidget(vazio)
+            self._layout_noticias_cards.addStretch(1)
+            return
+
+        for noticia in noticias:
+            if not isinstance(noticia, dict):
+                continue
+
+            card = QFrame()
+            card.setStyleSheet(
+                f"""
+                QFrame {{
+                    background-color: {Cores.FUNDO_CARD};
+                    border: 1px solid {Cores.BORDA};
+                    border-radius: 8px;
+                }}
+                """
+            )
+            layout_card = QVBoxLayout(card)
+            layout_card.setContentsMargins(12, 10, 12, 10)
+            layout_card.setSpacing(6)
+
+            topo = QHBoxLayout()
+            topo.setSpacing(6)
+
+            icone = QLabel(str(noticia.get("icone", "*") or "*"))
+            icone.setFont(Fontes.titulo_pequeno())
+            icone.setStyleSheet(f"color: {Cores.TEXTO_PRIMARY}; border: none;")
+            topo.addWidget(icone)
+
+            titulo = QLabel(str(noticia.get("titulo", "Noticia") or "Noticia"))
+            titulo.setFont(Fontes.texto_normal())
+            titulo.setStyleSheet(f"color: {Cores.TEXTO_PRIMARY}; border: none; font-weight: 700;")
+            titulo.setWordWrap(True)
+            topo.addWidget(titulo, 1)
+
+            rodada = noticia.get("rodada")
+            temporada = noticia.get("temporada")
+            meta_partes = []
+            if isinstance(temporada, int) and temporada > 0:
+                meta_partes.append(str(temporada))
+            if isinstance(rodada, int) and rodada > 0:
+                meta_partes.append(f"R{rodada}")
+            categoria_nome = str(noticia.get("categoria_nome", "") or "").strip()
+            if categoria_nome:
+                meta_partes.append(categoria_nome)
+            meta = QLabel(" | ".join(meta_partes))
+            meta.setFont(Fontes.texto_pequeno())
+            meta.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+            topo.addWidget(meta, 0, Qt.AlignRight)
+
+            layout_card.addLayout(topo)
+
+            texto_noticia = QLabel(str(noticia.get("texto", "") or ""))
+            texto_noticia.setWordWrap(True)
+            texto_noticia.setFont(Fontes.texto_pequeno())
+            texto_noticia.setStyleSheet(f"color: {Cores.TEXTO_SECONDARY}; border: none;")
+            layout_card.addWidget(texto_noticia)
+
+            self._layout_noticias_cards.addWidget(card)
+
+        self._layout_noticias_cards.addStretch(1)
+
+    def _popular_combo_outras_categorias(self) -> None:
+        if not hasattr(self, "combo_outras_categorias"):
+            return
+
+        jogador = self._obter_jogador()
+        categoria_jogador = str(
+            jogador.get("categoria_atual", self.categoria_atual) if isinstance(jogador, dict) else self.categoria_atual
+        ).strip()
+        categorias_externas = [
+            categoria
+            for categoria in CATEGORIAS
+            if str(categoria.get("id", "") or "").strip()
+            and str(categoria.get("id", "") or "").strip() != categoria_jogador
+        ]
+
+        atual = str(self.combo_outras_categorias.currentData() or "").strip()
+
+        self.combo_outras_categorias.blockSignals(True)
+        self.combo_outras_categorias.clear()
+        for categoria in categorias_externas:
+            categoria_id = str(categoria.get("id", "") or "").strip()
+            nome = str(categoria.get("nome", categoria_id) or categoria_id)
+            self.combo_outras_categorias.addItem(nome, categoria_id)
+
+        if self.combo_outras_categorias.count() > 0:
+            indice = self.combo_outras_categorias.findData(atual)
+            if indice < 0:
+                indice = 0
+            self.combo_outras_categorias.setCurrentIndex(indice)
+        self.combo_outras_categorias.blockSignals(False)
+
+    def _atualizar_aba_outras_categorias(self, *_args) -> None:
+        if not hasattr(self, "combo_outras_categorias"):
+            return
+
+        self._popular_combo_outras_categorias()
+
+        categoria_id = str(self.combo_outras_categorias.currentData() or "").strip()
+        if not categoria_id:
+            if hasattr(self, "lbl_outras_contexto"):
+                self.lbl_outras_contexto.setText("Sem categorias externas dispon?veis no momento.")
+            if hasattr(self, "tabela_outras_pilotos"):
+                self.tabela_outras_pilotos.setRowCount(0)
+            if hasattr(self, "tabela_outras_equipes"):
+                self.tabela_outras_equipes.setRowCount(0)
+            if hasattr(self, "lbl_outras_ultimo_resultado"):
+                self.lbl_outras_ultimo_resultado.setText("Ultimo resultado: sem dados.")
+            return
+
+        categoria_nome = obter_nome_categoria(categoria_id)
+        ano = int(self.banco.get("ano_atual", 2024) or 2024)
+
+        rodada_categoria = 0
+        obter_rodada = getattr(self, "_obter_rodada_categoria", None)
+        if callable(obter_rodada):
+            try:
+                rodada_categoria = int(obter_rodada(categoria_id) or 0)
+            except (TypeError, ValueError):
+                rodada_categoria = 0
+
+        total_corridas = 0
+        obter_total = getattr(self, "_obter_total_corridas_categoria", None)
+        if callable(obter_total):
+            try:
+                total_corridas = int(obter_total(categoria_id) or 0)
+            except (TypeError, ValueError):
+                total_corridas = 0
+
+        ultimos = self.banco.get("ultimos_resultados_por_categoria", {})
+        if isinstance(ultimos, dict):
+            ultimo = ultimos.get(categoria_id, {})
+        else:
+            ultimo = {}
+        if not isinstance(ultimo, dict):
+            ultimo = {}
+
+        rodada_ultima = int(ultimo.get("rodada", rodada_categoria) or rodada_categoria)
+        circuito_ultimo = str(ultimo.get("circuito", "") or "").strip()
+        if circuito_ultimo:
+            contexto = (
+                f"{categoria_nome} - Temporada {ano} | Rodada {rodada_ultima}/{max(1, total_corridas)}"
+                f" | ?ltima: {circuito_ultimo}"
+            )
+        else:
+            contexto = f"{categoria_nome} - Temporada {ano} | Rodada {rodada_categoria}/{max(1, total_corridas)}"
+
+        self.lbl_outras_contexto.setText(contexto)
+
+        pilotos = obter_pilotos_categoria(self.banco, categoria_id)
+        pilotos_ordenados = self._ordenar_pilotos_campeonato(pilotos)
+        self.tabela_outras_pilotos.setRowCount(len(pilotos_ordenados))
+        for row, piloto in enumerate(pilotos_ordenados):
+            self.tabela_outras_pilotos.setRowHeight(row, 28)
+            nome = str(piloto.get("nome", "Piloto") or "Piloto")
+            equipe = str(piloto.get("equipe_nome", "Sem equipe") or "Sem equipe")
+            pontos = int(piloto.get("pontos_temporada", 0) or 0)
+            self.tabela_outras_pilotos.setItem(
+                row,
+                0,
+                self._criar_item_tabela(row + 1, Cores.TEXTO_PRIMARY, Cores.FUNDO_CARD, Qt.AlignCenter),
+            )
+            self.tabela_outras_pilotos.setItem(
+                row,
+                1,
+                self._criar_item_tabela(nome, Cores.TEXTO_PRIMARY, Cores.FUNDO_CARD),
+            )
+            self.tabela_outras_pilotos.setItem(
+                row,
+                2,
+                self._criar_item_tabela(equipe, Cores.TEXTO_SECONDARY, Cores.FUNDO_CARD),
+            )
+            self.tabela_outras_pilotos.setItem(
+                row,
+                3,
+                self._criar_item_tabela(pontos, Cores.AMARELO, Cores.FUNDO_CARD, Qt.AlignCenter, negrito=True),
+            )
+
+        classificacao_equipes = obter_classificacao_equipes(self.banco, categoria_id)
+        self.tabela_outras_equipes.setRowCount(len(classificacao_equipes))
+        for row, equipe in enumerate(classificacao_equipes):
+            self.tabela_outras_equipes.setRowHeight(row, 28)
+            nome_equipe = str(equipe.get("nome", "Equipe") or "Equipe")
+            pontos_eq = int(equipe.get("pontos_temporada", 0) or 0)
+            self.tabela_outras_equipes.setItem(
+                row,
+                0,
+                self._criar_item_tabela(row + 1, Cores.TEXTO_PRIMARY, Cores.FUNDO_CARD, Qt.AlignCenter),
+            )
+            self.tabela_outras_equipes.setItem(
+                row,
+                1,
+                self._criar_item_tabela(nome_equipe, Cores.TEXTO_PRIMARY, Cores.FUNDO_CARD),
+            )
+            self.tabela_outras_equipes.setItem(
+                row,
+                2,
+                self._criar_item_tabela(pontos_eq, Cores.AMARELO, Cores.FUNDO_CARD, Qt.AlignCenter, negrito=True),
+            )
+
+        classificacao_ultima = ultimo.get("classificacao", []) if isinstance(ultimo, dict) else []
+        if isinstance(classificacao_ultima, list) and classificacao_ultima:
+            top = [
+                item
+                for item in classificacao_ultima
+                if isinstance(item, dict) and not bool(item.get("dnf", False))
+            ]
+            top1 = str(top[0].get("piloto_nome", "-") or "-") if len(top) > 0 else "-"
+            top2 = str(top[1].get("piloto_nome", "-") or "-") if len(top) > 1 else "-"
+
+            dnf = [
+                item
+                for item in classificacao_ultima
+                if isinstance(item, dict) and bool(item.get("dnf", False))
+            ]
+            if dnf:
+                nome_dnf = str(dnf[0].get("piloto_nome", "Piloto") or "Piloto")
+                motivo_dnf = str(dnf[0].get("motivo_dnf", "abandono") or "abandono")
+                txt_dnf = f" | DNF: {nome_dnf} ({motivo_dnf})"
+            else:
+                txt_dnf = ""
+
+            self.lbl_outras_ultimo_resultado.setText(
+                f"Ultimo resultado (Rodada {max(1, rodada_ultima)}): P1 {top1} | P2 {top2}{txt_dnf}"
+            )
+        else:
+            self.lbl_outras_ultimo_resultado.setText("Ultimo resultado: sem dados para esta categoria.")
 
     def _atualizar_info_temporada(self):
         ano = int(self.banco.get("ano_atual", 2024))
@@ -4368,154 +5739,8 @@ class TelaCarreira(
             self.lbl_info_temporada.setText(texto)
 
     def _atualizar_proxima_corrida(self):
-        evento = self._get_proximo_evento_exibicao()
-        corrida = evento or self._get_corrida_atual()
-
-        if not hasattr(self, "lbl_gp_nome"):
-            return
-
-        if not corrida:
-            self.lbl_gp_nome.setText("Temporada concluída")
-            self.lbl_circuito.setText("Finalize a temporada para avançar.")
-            self.card_clima.set_valor("—")
-            self.card_temp.set_valor("—")
-            self.card_voltas.set_valor("—")
-            return
-
-        self.lbl_gp_nome.setText(corrida.get("nome", "—"))
-        self.lbl_circuito.setText(corrida.get("circuito", ""))
-        if hasattr(self, "lbl_evento_contexto"):
-            if evento and evento.get("tipo_evento") == "pcc":
-                detalhe = str(evento.get("detalhe", "")).strip()
-                contexto = "Convite para serie paralela."
-                if detalhe:
-                    contexto = f"{contexto} {detalhe}"
-                self.lbl_evento_contexto.setText(contexto)
-            else:
-                mes_nome = ""
-                if evento:
-                    mes_nome = str(evento.get("mes_nome", "")).strip()
-                contexto = "Evento principal"
-                if mes_nome:
-                    contexto = f"{contexto} - {mes_nome}"
-                self.lbl_evento_contexto.setText(contexto)
-        self.card_clima.set_valor(self._formatar_clima(corrida.get("clima", "—")))
-        self.card_temp.set_valor(self._formatar_temperatura(corrida.get("temperatura", "—")))
-        self.card_voltas.set_valor(str(corrida.get("voltas", "—")))
-
-    def _atualizar_calendario_visual(self):
-        if not hasattr(self, "tabela_calendario"):
-            return
-
-        ano = int(self.banco.get("ano_atual", 2024))
-        campeonato = NOMES_CAMPEONATO.get(
-            self.categoria_atual,
-            obter_nome_categoria(self.categoria_atual),
-        )
-        self.lbl_calendario_titulo.setText(f"{campeonato} - {ano}")
-
-        calendario = self._obter_calendario_temporada()
-        total_rodadas = self._obter_total_rodadas_temporada()
-        total_linhas = max(total_rodadas, len(calendario))
-
-        jogador = self._obter_jogador()
-        resultados_jogador = []
-        if jogador:
-            resultados_jogador = jogador.get("resultados_temporada", [])
-            if not isinstance(resultados_jogador, list):
-                resultados_jogador = []
-
-        corridas_disputadas = self._corridas_disputadas()
-        temporada_concluida = self._temporada_concluida()
-
-        self.tabela_calendario.setRowCount(total_linhas)
-
-        for indice in range(total_linhas):
-            self.tabela_calendario.setRowHeight(indice, 30)
-
-            corrida = calendario[indice] if indice < len(calendario) else {}
-            if not isinstance(corrida, dict):
-                corrida = {}
-
-            pista = str(corrida.get("circuito", "")).strip() or "—"
-            status, cor_status = self._status_rodada_calendario(
-                indice,
-                corridas_disputadas,
-                temporada_concluida,
-            )
-
-            if indice < corridas_disputadas:
-                resultado_raw = (
-                    resultados_jogador[indice]
-                    if indice < len(resultados_jogador)
-                    else None
-                )
-                resultado, cor_resultado = self._formatar_resultado_calendario(resultado_raw)
-            else:
-                resultado, cor_resultado = "—", Cores.TEXTO_MUTED
-
-            if indice < corridas_disputadas:
-                cor_fundo = "#1a3a2a"
-            elif indice % 2 == 0:
-                cor_fundo = Cores.FUNDO_CARD
-            else:
-                cor_fundo = Cores.FUNDO_APP
-
-            self.tabela_calendario.setItem(
-                indice,
-                0,
-                self._criar_item_tabela(
-                    indice + 1,
-                    Cores.TEXTO_PRIMARY,
-                    cor_fundo,
-                    Qt.AlignCenter,
-                ),
-            )
-            self.tabela_calendario.setItem(
-                indice,
-                1,
-                self._criar_item_tabela(
-                    pista,
-                    Cores.TEXTO_PRIMARY,
-                    cor_fundo,
-                ),
-            )
-            self.tabela_calendario.setItem(
-                indice,
-                2,
-                self._criar_item_tabela(
-                    status,
-                    cor_status,
-                    cor_fundo,
-                    Qt.AlignCenter,
-                ),
-            )
-            self.tabela_calendario.setItem(
-                indice,
-                3,
-                self._criar_item_tabela(
-                    resultado,
-                    cor_resultado,
-                    cor_fundo,
-                    Qt.AlignCenter,
-                ),
-            )
-
-        pontos = int(jogador.get("pontos_temporada", 0)) if jogador else 0
-        posicao = self._obter_posicao_jogador() if jogador else "-"
-
-        icone_posicao = ""
-        if posicao == 1:
-            icone_posicao = " 🏆"
-        elif posicao == 2:
-            icone_posicao = " 🥈"
-        elif posicao == 3:
-            icone_posicao = " 🥉"
-
-        posicao_texto = f"{posicao}º" if isinstance(posicao, int) else "-"
-        self.lbl_calendario_resumo.setText(
-            f"Pontuação: {pontos} pts | Posição: {posicao_texto}{icone_posicao}"
-        )
+        if hasattr(self, "_rw_stack"):
+            self._rw_atualizar_tela_weekend()
 
     def _atualizar_previsao_campeonato(self):
         if not hasattr(self, "lbl_previsao_temporada"):
@@ -5402,9 +6627,112 @@ class TelaCarreira(
         self.tabela_equipes.viewport().update()
         self._atualizar_grafico_equipes_dashboard()
 
+    @staticmethod
+    def _formatar_papel_resumo_jogador(papel_raw: Any) -> str:
+        papel = str(papel_raw or "").strip().lower()
+        if papel in {"numero_1", "n1"}:
+            return "Nº1"
+        if papel in {"numero_2", "n2"}:
+            return "Nº2"
+        if papel == "reserva":
+            return "Reserva"
+        return "-"
+
     def _atualizar_stats_jogador(self):
-        # O dashboard foi movido para a tabela principal de pilotos.
-        return
+        if not hasattr(self, "lbl_resumo_jogador_titulo"):
+            return
+
+        jogador = self._obter_jogador()
+        if not isinstance(jogador, dict):
+            self.lbl_resumo_jogador_titulo.setText("Sem jogador ativo")
+            self.lbl_resumo_jogador_l1.setText("Equipe: - | Papel: -")
+            self.lbl_resumo_jogador_l2.setText("Contrato: -")
+            self.lbl_resumo_jogador_l3.setText("Posicao: - | Pontos: -")
+            self.lbl_resumo_jogador_l4.setText("Proxima corrida: -")
+            if hasattr(self, "lbl_contrato_alerta"):
+                self.lbl_contrato_alerta.setText("Contrato: sem alertas")
+                self.lbl_contrato_alerta.setToolTip("")
+                self.lbl_contrato_alerta.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+            if hasattr(self, "btn_meu_perfil_dashboard"):
+                self.btn_meu_perfil_dashboard.setEnabled(False)
+            return
+
+        categoria_jogador = str(jogador.get("categoria_atual", self.categoria_atual) or self.categoria_atual).strip()
+        categoria_nome = obter_nome_categoria(categoria_jogador) if categoria_jogador else "-"
+        nome_jogador = str(jogador.get("nome", "Jogador") or "Jogador")
+        equipe_nome = str(jogador.get("equipe_nome", "Sem equipe") or "Sem equipe")
+        papel = self._formatar_papel_resumo_jogador(jogador.get("papel"))
+
+        contrato_anos = max(0, int(jogador.get("contrato_anos", 0) or 0))
+        contrato_txt = (
+            f"{contrato_anos} ano(s) restante(s)"
+            if contrato_anos > 0
+            else "Contrato encerrando nesta temporada"
+        )
+
+        pilotos_categoria = obter_pilotos_categoria(self.banco, categoria_jogador)
+        pilotos_ordenados = self._ordenar_pilotos_por_desempenho_dashboard(pilotos_categoria)
+        total_pilotos = len(pilotos_ordenados)
+        posicao = next(
+            (
+                indice + 1
+                for indice, piloto in enumerate(pilotos_ordenados)
+                if isinstance(piloto, dict) and bool(piloto.get("is_jogador", False))
+            ),
+            "-",
+        )
+        pontos = int(jogador.get("pontos_temporada", 0) or 0)
+        if isinstance(posicao, int):
+            posicao_txt = f"{posicao}º / {max(1, total_pilotos)}"
+        else:
+            posicao_txt = "-"
+
+        evento = self._get_proximo_evento_exibicao()
+        corrida = evento or self._get_corrida_atual()
+        if corrida and not self._temporada_concluida():
+            try:
+                rodada_atual = int(self.banco.get("rodada_atual", 1) or 1)
+            except (TypeError, ValueError):
+                rodada_atual = 1
+            total_rodadas = self._obter_total_rodadas_temporada()
+            nome_corrida = str(corrida.get("circuito", corrida.get("nome", "Proxima corrida")) or "Proxima corrida")
+            rodada_exibicao = min(max(rodada_atual, 1), max(1, total_rodadas))
+            proxima_txt = f"Proxima corrida: {nome_corrida} (Rodada {rodada_exibicao}/{max(1, total_rodadas)})"
+        elif self._temporada_concluida():
+            proxima_txt = "Proxima corrida: temporada concluida"
+        else:
+            proxima_txt = "Proxima corrida: calendario indisponivel"
+
+        self.lbl_resumo_jogador_titulo.setText(f"{nome_jogador} - {categoria_nome}")
+        self.lbl_resumo_jogador_l1.setText(f"Equipe: {equipe_nome} | Papel: {papel}")
+        self.lbl_resumo_jogador_l2.setText(f"Contrato: {contrato_txt}")
+        self.lbl_resumo_jogador_l3.setText(f"Posicao: {posicao_txt} | Pontos: {pontos}")
+        self.lbl_resumo_jogador_l4.setText(proxima_txt)
+        if hasattr(self, "lbl_contrato_alerta"):
+            _exp, avaliacao = self._obter_expectativa_e_avaliacao()
+            alerta_contrato = self._rw_obter_alerta_contratual_visual(avaliacao=avaliacao)
+            if isinstance(alerta_contrato, dict):
+                tipo = str(alerta_contrato.get("tipo", "") or "").strip().lower()
+                if tipo == "perigo":
+                    cor = Cores.VERMELHO
+                elif tipo == "positivo":
+                    cor = Cores.VERDE
+                else:
+                    cor = Cores.AMARELO
+                icone = str(alerta_contrato.get("icone", "") or "").strip()
+                titulo = str(alerta_contrato.get("titulo", "Contrato") or "Contrato")
+                texto = str(alerta_contrato.get("texto", "") or "").strip()
+                detalhe = str(alerta_contrato.get("detalhe", "") or "").strip()
+                tooltip = f"{texto}\n{detalhe}".strip()
+                self.lbl_contrato_alerta.setStyleSheet(f"color: {cor}; border: none; font-weight: 700;")
+                self.lbl_contrato_alerta.setText(f"{icone} {titulo}".strip())
+                self.lbl_contrato_alerta.setToolTip(tooltip)
+            else:
+                self.lbl_contrato_alerta.setText("Contrato: sem alertas")
+                self.lbl_contrato_alerta.setToolTip("")
+                self.lbl_contrato_alerta.setStyleSheet(f"color: {Cores.TEXTO_MUTED}; border: none;")
+        if hasattr(self, "btn_meu_perfil_dashboard"):
+            self.btn_meu_perfil_dashboard.setEnabled(True)
 
     def _atualizar_minha_equipe(self):
         jogador = self._obter_jogador()
@@ -5430,6 +6758,12 @@ class TelaCarreira(
             self.info_dinamica_detalhe.set_valor("-")
             self.info_pts_equipe.set_valor("0")
             self.info_vit_equipe.set_valor("0")
+            self._atualizar_comparacao_jogador_companheiro(None, None, {})
+            if hasattr(self, "lbl_expectativa_faixa"):
+                self.lbl_expectativa_faixa.setText("Expectativa: -")
+                self.lbl_expectativa_status.setText("Avaliacao: -")
+                self.lbl_expectativa_impacto.setText("Impacto: -")
+                self.txt_historico_avaliacao.setText("Sem dados de avaliacao.")
             return
 
         cor_equipe = equipe_data.get("cor_primaria", Cores.ACCENT_PRIMARY)
@@ -5531,6 +6865,177 @@ class TelaCarreira(
         self.info_dinamica_detalhe.set_valor(detalhe)
         self.info_pts_equipe.set_valor(str(equipe_data.get("pontos_temporada", 0)))
         self.info_vit_equipe.set_valor(str(equipe_data.get("vitorias_temporada", 0)))
+
+        companheiro = None
+        jogador_id = jogador.get("id") if isinstance(jogador, dict) else None
+        if isinstance(jogador, dict) and isinstance(piloto_n1, dict) and not self._ids_equivalentes_resultado(piloto_n1.get("id"), jogador_id):
+            companheiro = piloto_n1
+        if isinstance(jogador, dict) and isinstance(piloto_n2, dict) and not self._ids_equivalentes_resultado(piloto_n2.get("id"), jogador_id):
+            companheiro = piloto_n2
+        if not isinstance(companheiro, dict):
+            equipe_nome = str(equipe_data.get("nome", "") or "").strip().casefold()
+            for piloto in self.banco.get("pilotos", []):
+                if not isinstance(piloto, dict):
+                    continue
+                if bool(piloto.get("aposentado", False)):
+                    continue
+                if str(piloto.get("equipe_nome", "") or "").strip().casefold() != equipe_nome:
+                    continue
+                if self._ids_equivalentes_resultado(piloto.get("id"), jogador_id):
+                    continue
+                companheiro = piloto
+                break
+
+        self._atualizar_comparacao_jogador_companheiro(jogador, companheiro, hierarquia)
+
+        if hasattr(self, "lbl_expectativa_faixa"):
+            expectativa, avaliacao = self._obter_expectativa_e_avaliacao(
+                persistir_historico=True,
+            )
+            if isinstance(expectativa, dict) and isinstance(avaliacao, dict):
+                faixa = str(expectativa.get("texto_faixa", "Top") or "Top")
+                pos_real = int(avaliacao.get("posicao_real", 0) or 0)
+                self.lbl_expectativa_faixa.setText(f"Expectativa: {faixa}")
+                self.lbl_expectativa_status.setText(
+                    f"Desempenho atual: {pos_real}o | {avaliacao.get('emoji', '')} {avaliacao.get('texto', '')}"
+                )
+                self.lbl_expectativa_impacto.setText(f"Impacto: {avaliacao.get('impacto', '-')}")
+
+                historico_raw = self.banco.get("historico_avaliacoes", [])
+                historico = [
+                    item
+                    for item in historico_raw
+                    if isinstance(item, dict)
+                    and str(item.get("categoria_id", "") or "") == str(self.categoria_atual or "")
+                ]
+                historico.sort(key=lambda item: int(item.get("rodada", 0) or 0))
+                linhas_hist = []
+                for item in historico[-8:]:
+                    rodada = int(item.get("rodada", 0) or 0)
+                    nivel = str(item.get("nivel", "neutro") or "neutro")
+                    pos = int(item.get("posicao", 0) or 0)
+                    emoji = {
+                        "impressionada": "😍",
+                        "satisfeita": "😊",
+                        "neutra": "😐",
+                        "preocupada": "😟",
+                        "insatisfeita": "😠",
+                    }.get(nivel, "😐")
+                    linhas_hist.append(f"Rodada {rodada}: {emoji} {nivel} (posicao {pos}o)")
+                self.txt_historico_avaliacao.setText(
+                    "\n".join(linhas_hist) if linhas_hist else "Sem historico de avaliacao."
+                )
+            else:
+                self.lbl_expectativa_faixa.setText("Expectativa: -")
+                self.lbl_expectativa_status.setText("Avaliacao: sem dados")
+                self.lbl_expectativa_impacto.setText("Impacto: -")
+                self.txt_historico_avaliacao.setText("Sem historico de avaliacao.")
+
+    def _valor_int_comparacao(self, piloto: dict[str, Any] | None, campo: str, padrao: int = 0) -> int:
+        if not isinstance(piloto, dict):
+            return int(padrao)
+        try:
+            return int(round(float(piloto.get(campo, padrao) or padrao)))
+        except (TypeError, ValueError):
+            return int(padrao)
+
+    def _atualizar_comparacao_jogador_companheiro(
+        self,
+        jogador: dict[str, Any] | None,
+        companheiro: dict[str, Any] | None,
+        hierarquia: dict[str, Any] | None,
+    ) -> None:
+        if not hasattr(self, "tabela_comparacao_dupla"):
+            return
+
+        tabela = self.tabela_comparacao_dupla
+        tabela.clearContents()
+
+        if not isinstance(jogador, dict):
+            tabela.setRowCount(0)
+            if hasattr(self, "lbl_comparacao_status"):
+                self.lbl_comparacao_status.setText("Comparacao indisponivel sem jogador ativo.")
+            return
+
+        papel_jogador = self._formatar_papel_resumo_jogador(jogador.get("papel"))
+        nome_jogador = str(jogador.get("nome", "Voce") or "Voce")
+
+        if isinstance(companheiro, dict):
+            nome_comp = str(companheiro.get("nome", "Companheiro") or "Companheiro")
+            papel_comp = self._formatar_papel_resumo_jogador(companheiro.get("papel"))
+        else:
+            nome_comp = "Sem companheiro"
+            papel_comp = "-"
+
+        melhor_j = self._valor_int_comparacao(jogador, "melhor_resultado_temporada", 99)
+        melhor_c = self._valor_int_comparacao(companheiro, "melhor_resultado_temporada", 99)
+        melhor_j_txt = "-" if melhor_j <= 0 or melhor_j >= 99 else f"P{melhor_j}"
+        melhor_c_txt = "-" if melhor_c <= 0 or melhor_c >= 99 else f"P{melhor_c}"
+
+        linhas = [
+            ("Nome", nome_jogador, nome_comp, "texto"),
+            ("Status", papel_jogador, papel_comp, "texto"),
+            ("Skill", self._valor_int_comparacao(jogador, "skill", 0), self._valor_int_comparacao(companheiro, "skill", 0), "maior"),
+            ("Corridas", self._valor_int_comparacao(jogador, "corridas_temporada", 0), self._valor_int_comparacao(companheiro, "corridas_temporada", 0), "maior"),
+            ("Vit?rias", self._valor_int_comparacao(jogador, "vitorias_temporada", 0), self._valor_int_comparacao(companheiro, "vitorias_temporada", 0), "maior"),
+            ("P?dios", self._valor_int_comparacao(jogador, "podios_temporada", 0), self._valor_int_comparacao(companheiro, "podios_temporada", 0), "maior"),
+            ("Pontos", self._valor_int_comparacao(jogador, "pontos_temporada", 0), self._valor_int_comparacao(companheiro, "pontos_temporada", 0), "maior"),
+            ("Melhor", melhor_j_txt, melhor_c_txt, "menor"),
+        ]
+
+        tabela.setRowCount(len(linhas))
+        fundo_primario = Cores.FUNDO_CARD
+        fundo_secundario = "#101929"
+        cor_destaque = "#163528"
+
+        for row, (rotulo, valor_j, valor_c, regra) in enumerate(linhas):
+            fundo = fundo_secundario if row % 2 else fundo_primario
+            tabela.setRowHeight(row, 28)
+
+            item_rotulo = self._criar_item_tabela(rotulo, Cores.TEXTO_SECONDARY, fundo)
+            tabela.setItem(row, 0, item_rotulo)
+
+            item_j = self._criar_item_tabela(str(valor_j), Cores.TEXTO_PRIMARY, fundo, Qt.AlignCenter)
+            item_c = self._criar_item_tabela(str(valor_c), Cores.TEXTO_PRIMARY, fundo, Qt.AlignCenter)
+
+            if regra in {"maior", "menor"}:
+                comp_j = valor_j
+                comp_c = valor_c
+                if regra == "menor":
+                    try:
+                        comp_j = int(str(valor_j).replace("P", "")) if str(valor_j).startswith("P") else 999
+                    except ValueError:
+                        comp_j = 999
+                    try:
+                        comp_c = int(str(valor_c).replace("P", "")) if str(valor_c).startswith("P") else 999
+                    except ValueError:
+                        comp_c = 999
+
+                if comp_j != comp_c:
+                    if (regra == "maior" and comp_j > comp_c) or (regra == "menor" and comp_j < comp_c):
+                        item_j.setBackground(QBrush(QColor(cor_destaque)))
+                    else:
+                        item_c.setBackground(QBrush(QColor(cor_destaque)))
+
+            tabela.setItem(row, 1, item_j)
+            tabela.setItem(row, 2, item_c)
+
+        if hasattr(self, "lbl_comparacao_status"):
+            status = str((hierarquia or {}).get("status", "estavel") or "estavel")
+            corridas_n2 = int((hierarquia or {}).get("corridas_n2_a_frente", 0) or 0)
+            jogador_n2 = str(jogador.get("papel", "") or "").strip().lower() in {"numero_2", "n2"}
+            if jogador_n2 and corridas_n2 > 0:
+                self.lbl_comparacao_status.setText(
+                    f"Status interno: {status}. Voce esta a frente ha {corridas_n2} corrida(s)."
+                )
+            elif corridas_n2 > 0:
+                self.lbl_comparacao_status.setText(
+                    f"Status interno: {status}. Companheiro esta a frente ha {corridas_n2} corrida(s)."
+                )
+            else:
+                self.lbl_comparacao_status.setText(
+                    f"Status interno: {status}. Sem vantagem recente entre os dois pilotos."
+                )
 
     # ============================================================
     # FICHAS
@@ -5718,3 +7223,6 @@ class TelaCarreira(
         indice_ativo = self.tabs.currentIndex()
         for indice, botao in enumerate(botoes):
             botao.setChecked(indice == indice_ativo)
+
+
+

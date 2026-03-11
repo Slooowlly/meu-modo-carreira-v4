@@ -32,6 +32,7 @@ from PySide6.QtWidgets import (
 )
 
 from Dados.constantes import CATEGORIAS, PONTOS_POR_POSICAO
+from Logica.milestones import obter_historico_milestones, obter_proximo_milestone
 from UI.componentes import (
     BotaoSecondary,
     CampoCombo,
@@ -2449,7 +2450,51 @@ class TelaHistoria(QWidget, UXMixin):
             if entrada:
                 temporadas_jogador.append((temporada, entrada))
 
-        if not temporadas_jogador:
+        milestones_hist = obter_historico_milestones(self.banco)
+        jogador_atual = self._obter_jogador_atual() or {}
+
+        if milestones_hist:
+            card_milestones = CardTitulo("MARCOS DE CARREIRA")
+            ordenados = sorted(
+                milestones_hist,
+                key=lambda item: (
+                    self._safe_int(item.get("temporada"), default=0),
+                    self._safe_int(item.get("rodada"), default=0),
+                ),
+            )
+            for item in ordenados:
+                if not isinstance(item, dict):
+                    continue
+                icone = str(item.get("icone", "🏆") or "🏆")
+                titulo = str(item.get("titulo", "Marco") or "Marco")
+                temporada_txt = self._safe_int(item.get("temporada"), default=0)
+                rodada_txt = self._safe_int(item.get("rodada"), default=0)
+                detalhe = f"Temporada {temporada_txt}" if temporada_txt > 0 else "Temporada -"
+                if rodada_txt > 0:
+                    detalhe = f"{detalhe} | Rodada {rodada_txt}"
+
+                lbl = QLabel(f"{icone}  {titulo}  —  {detalhe}")
+                lbl.setFont(Fontes.texto_normal())
+                lbl.setStyleSheet(f"color: {HIST_TEXT_SECONDARY}; border: none;")
+                lbl.setWordWrap(True)
+                card_milestones.add(lbl)
+
+            proximo = obter_proximo_milestone(jogador_atual) if isinstance(jogador_atual, dict) else None
+            if isinstance(proximo, dict):
+                atual = self._safe_int(proximo.get("atual"), default=0)
+                alvo = self._safe_int(proximo.get("alvo"), default=1)
+                icone = str(proximo.get("icone", "🏁") or "🏁")
+                titulo = str(proximo.get("titulo", "Proximo marco") or "Proximo marco")
+                lbl_proximo = QLabel(f"Proximo marco: {icone} {titulo} (atual: {atual}/{alvo})")
+                lbl_proximo.setFont(Fontes.texto_normal())
+                lbl_proximo.setStyleSheet(f"color: {HIST_ACCENT}; border: none; font-weight: 700;")
+                lbl_proximo.setWordWrap(True)
+                card_milestones.add(Separador())
+                card_milestones.add(lbl_proximo)
+
+            self._layout_trofeus.addWidget(card_milestones)
+
+        if not temporadas_jogador and not milestones_hist:
             vazio = QLabel("Nenhum troféu registrado ainda para o jogador.")
             vazio.setAlignment(Qt.AlignCenter)
             vazio.setFont(Fontes.texto_normal())
